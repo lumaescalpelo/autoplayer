@@ -1,270 +1,310 @@
 #!/usr/bin/env python3
-# ---------------------------------------------
-#  LEADER — Sistema robusto de reproducción
-#  Sincronización museográfica multiscreen
-#  Versión diseñada para producción (Luma Escalpelo)
-# ---------------------------------------------
+# -------------------------------------------------------
+# FOLLOWER — robusto + fallback offline
+# - Audio determinístico por hostname (loop infinito)
+# - Cache de videos al inicio (sin I/O pesado en PLAY)
+# - Si no hay leader: reproduce categorías random (offline)
+# - Si reaparece leader: vuelve a modo sync automáticamente
+# -------------------------------------------------------
 
-import socket
 import os
 import time
 import random
+import socket
 import threading
-from tempfile import NamedTemporaryFile
 import subprocess
 import getpass
+from tempfile import NamedTemporaryFile
 
-
-# ---------------------------------------------
-# CONFIGURACIÓN GENERAL
-# ---------------------------------------------
 USERNAME = getpass.getuser()
 
-# Carpeta raíz donde viven las categorías:
-# /home/pi/Videos/videos_hd_final/CATEGORIA/hor/
-# /home/pi/Videos/videos_hd_final/CATEGORIA/hor_text/
 BASE_VIDEO_DIR = f"/home/{USERNAME}/Videos/videos_hd_final"
-
-# Carpeta de audios (opcional en leader)
 BASE_AUDIO_DIR = f"/home/{USERNAME}/Music/audios"
 
-VIDEO_EXTENSIONS = ('.mp4', '.mov')
-AUDIO_EXTENSIONS = ('.mp3', '.wav', '.ogg')
+VIDEO_EXTENSIONS = (".mp4", ".mov")
+AUDIO_EXTENSIONS = (".mp3", ".wav", ".ogg")
 
-# Frecuencia de broadcast del líder
-BROADCAST_INTERVAL = 5          # segundos
+BCAST_PORT = 8888
+REG_PORT = 8899
+CMD_PORT = 9001
+DONE_PORT = 9100
 
-# Tiempo de seguridad para evitar colisiones entre DONE y NEXT
-DONE_DELAY = 2                  # segundos
+OFFLINE_AFTER = 15          # s sin leader => modo offline
+OFFLINE_GAP = 0.8           # s entre categorías offline
+DONE_DELAY = 0.3            # s
 
+leader_ip = None
+leader_lock = threading.Lock()
 
-# ---------------------------------------------
-# VARIABLES GLOBALES
-# ---------------------------------------------
-followers = set()               # IPs registradas
-categoria_queue = []            # Lista de categorías
-current_category = None         # Categoría activa
+current_category = None
+category_lock = threading.Lock()
 
-done_flag = threading.Event()   # Señal cuando un follower termina
+playing_flag = threading.Event()      # asegura 1 mpv a la vez
+mode_lock = threading.Lock()
+mode = "SYNC"  # SYNC o OFFLINE
 
+cache = {}  # categoria -> {"text": [...], "videos": [...]}
 
-# ---------------------------------------------
-# UTILIDADES
-# ---------------------------------------------
-def is_valid_video(filename):
-    return filename.lower().endswith(VIDEO_EXTENSIONS)
-
-def is_valid_audio(filename):
-    return filename.lower().endswith(AUDIO_EXTENSIONS)
+audio_started = False
 
 
-# ---------------------------------------------
-# 1) Cargar categorías una sola vez
-# ---------------------------------------------
-def pick_categories():
-    if not os.path.exists(BASE_VIDEO_DIR):
-        print(f"❌ No existe la carpeta de videos: {BASE_VIDEO_DIR}")
-        return []
-
-    categorias = [
-        d for d in os.listdir(BASE_VIDEO_DIR)
-        if os.path.isdir(os.path.join(BASE_VIDEO_DIR, d))
-    ]
-
-    categorias.sort()
-    print(f"📂 Categorías detectadas: {categorias}")
-    return categorias
+def is_valid_video(n): return n.lower().endswith(VIDEO_EXTENSIONS)
+def is_valid_audio(n): return n.lower().endswith(AUDIO_EXTENSIONS)
 
 
-# ---------------------------------------------
-# 2) Elegir videos para una categoría
-# ---------------------------------------------
-def pick_videos(categoria):
-    """
-    Devuelve un bloque de [texto, video1, video2, video3]
-    """
-    text_path = os.path.join(BASE_VIDEO_DIR, categoria, "hor_text")
-    video_path = os.path.join(BASE_VIDEO_DIR, categoria, "hor")
+def build_cache():
+    global cache
+    if not os.path.isdir(BASE_VIDEO_DIR):
+        print(f"❌ No existe BASE_VIDEO_DIR: {BASE_VIDEO_DIR}")
+        return
 
-    if not os.path.exists(text_path) or not os.path.exists(video_path):
-        print(f"⚠️ No hay carpetas adecuadas para {categoria}")
-        return []
+    cats = [d for d in os.listdir(BASE_VIDEO_DIR) if os.path.isdir(os.path.join(BASE_VIDEO_DIR, d))]
+    cats.sort()
 
-    textos = [f for f in os.listdir(text_path) if is_valid_video(f)]
-    videos = [f for f in os.listdir(video_path) if is_valid_video(f)]
+    tmp = {}
+    for cat in cats:
+        text_dir = os.path.join(BASE_VIDEO_DIR, cat, "hor_text")
+        vid_dir = os.path.join(BASE_VIDEO_DIR, cat, "hor")
 
-    if len(textos) < 1 or len(videos) < 3:
-        print(f"⚠️ No hay suficientes videos para {categoria}")
-        return []
+        textos = []
+        vids = []
 
-    text_file = random.choice(textos)
-    chosen = random.sample(videos, 3)
+        if os.path.isdir(text_dir):
+            textos = [os.path.join(text_dir, f) for f in os.listdir(text_dir) if is_valid_video(f)]
+        if os.path.isdir(vid_dir):
+            vids = [os.path.join(vid_dir, f) for f in os.listdir(vid_dir) if is_valid_video(f)]
 
-    return [
-        os.path.join(text_path, text_file),
-        os.path.join(video_path, chosen[0]),
-        os.path.join(video_path, chosen[1]),
-        os.path.join(video_path, chosen[2]),
-    ]
+        tmp[cat] = {"text": textos, "videos": vids}
+
+    cache = tmp
+    print(f"✔ Cache lista. Categorías: {list(cache.keys())}")
 
 
-# ---------------------------------------------
-# 3) Generar playlist temporal
-# ---------------------------------------------
-def generate_playlist(videos):
-    f = NamedTemporaryFile(delete=False, mode='w', suffix=".m3u")
-    for v in videos:
-        f.write(v + '\n')
+def pick_audio_deterministic():
+    if not os.path.isdir(BASE_AUDIO_DIR):
+        print(f"⚠️ No existe carpeta de audio: {BASE_AUDIO_DIR}")
+        return None
+
+    audios = [f for f in os.listdir(BASE_AUDIO_DIR) if is_valid_audio(f)]
+    if not audios:
+        print("⚠️ No hay audios válidos")
+        return None
+
+    audios.sort()
+    host = socket.gethostname()
+    idx = sum(ord(c) for c in host) % len(audios)
+    path = os.path.join(BASE_AUDIO_DIR, audios[idx])
+    print(f"🔊 Audio asignado a {host}: {path}")
+    return path
+
+
+def audio_loop(path):
+    # mpv loop infinito del archivo asignado
+    while True:
+        subprocess.run(["mpv", "--no-terminal", "--quiet", "--loop", path])
+
+
+def ensure_audio():
+    global audio_started
+    if audio_started:
+        return
+    p = pick_audio_deterministic()
+    if p:
+        threading.Thread(target=audio_loop, args=(p,), daemon=True).start()
+        audio_started = True
+
+
+def make_playlist(cat):
+    block = cache.get(cat)
+    if not block:
+        return None
+    textos = block["text"]
+    vids = block["videos"]
+    if len(textos) < 1 or len(vids) < 3:
+        return None
+
+    items = [random.choice(textos)] + random.sample(vids, 3)
+
+    f = NamedTemporaryFile(delete=False, mode="w", suffix=".m3u")
+    for it in items:
+        f.write(it + "\n")
     f.close()
     return f.name
 
 
-# ---------------------------------------------
-# 4) Reproducción de video del líder (solo 1 pantalla)
-# ---------------------------------------------
-def play_video_sequence(playlist_path):
+def mpv_play_playlist(path):
     subprocess.run([
-        "mpv", "--fs", "--vo=gpu", "--hwdec=no",
+        "mpv",
+        "--fs", "--vo=gpu", "--hwdec=no",
         "--no-terminal", "--quiet",
         "--gapless-audio", "--image-display-duration=inf",
         "--no-stop-screensaver",
         "--keep-open=no", "--loop-playlist=no",
-        f"--playlist={playlist_path}"
+        f"--playlist={path}"
     ])
-    os.remove(playlist_path)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
 
 
-# ---------------------------------------------
-# 5) Broadcast del líder (solo LEADER_HERE)
-# ---------------------------------------------
-def broadcast_leader():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-    while True:
-        msg = f"LEADER_HERE:{','.join(categoria_queue)}"
-        sock.sendto(msg.encode(), ('<broadcast>', 8888))
-        time.sleep(BROADCAST_INTERVAL)
-
-
-# ---------------------------------------------
-# 6) Recepción de followers
-# ---------------------------------------------
-def listen_for_followers():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(('', 8899))
-
-    print("👂 Esperando followers en puerto 8899...")
-
-    while True:
-        data, addr = sock.recvfrom(1024)
-        msg = data.decode()
-
-        if msg.startswith("REGISTER:"):
-            ip = addr[0]
-            followers.add(ip)
-            print(f"✅ Nuevo follower registrado: {ip}")
-
-            # si ya hay categoría activa → sincronizar
-            if current_category:
-                send_to_followers(f"PLAY:{current_category}")
+def send_done():
+    with leader_lock:
+        lip = leader_ip
+    if not lip:
+        return
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.sendto(b"done", (lip, DONE_PORT))
+        print("📨 DONE enviado")
+    except Exception:
+        pass
 
 
-# ---------------------------------------------
-# 7) Enviar comandos a followers
-# ---------------------------------------------
-def send_to_followers(message):
-    for ip in list(followers):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.sendto(message.encode(), (ip, 9001))
-            print(f"📨 Enviado a {ip}: {message}")
-        except Exception as e:
-            print(f"⚠️ Error enviando a {ip}: {e}")
-            followers.discard(ip)
+def play_category(cat, report_done: bool):
+    # asegura solo 1 reproducción a la vez
+    if playing_flag.is_set():
+        return
+    playing_flag.set()
 
+    with category_lock:
+        global current_category
+        current_category = cat
 
-# ---------------------------------------------
-# 8) Recepción de DONE
-# ---------------------------------------------
-def receive_done():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(('', 9100))
-
-    print("🕓 Escuchando DONE en puerto 9100...")
-
-    while True:
-        data, addr = sock.recvfrom(1024)
-        if data.decode() == 'done':
-            print(f"✔ DONE recibido desde {addr[0]}")
-            done_flag.set()
-
-
-# ---------------------------------------------
-# 9) Bucle maestro
-# ---------------------------------------------
-def play_loop():
-    global current_category
-
-    while True:
-        random.shuffle(categoria_queue)
-
-        for categoria in categoria_queue:
-
-            current_category = categoria
-            print(f"\n🎬 Nueva categoría: {categoria}")
-
-            # Elegir bloque para la pantalla del líder
-            videos = pick_videos(categoria)
-            if not videos:
-                continue
-
-            playlist = generate_playlist(videos)
-
-            # PLAY solo una vez a todos los followers
-            send_to_followers(f"PLAY:{categoria}")
-
-            # Seguridad para evitar colisiones con NEXT y DONE
-            done_flag.clear()
-            time.sleep(0.2)
-
-            # El líder reproduce en paralelo
-            threading.Thread(
-                target=play_video_sequence,
-                args=(playlist,),
-                daemon=True
-            ).start()
-
-            print("⏳ Esperando DONE...")
-            done_flag.wait()      # avanzamos cuando el PRIMERO termine
-
-            # NEXT global
-            print("⏭ Avanzando de categoría")
-            send_to_followers("NEXT")
-
-            time.sleep(DONE_DELAY)
-
-
-# ---------------------------------------------
-# 10) MAIN
-# ---------------------------------------------
-def main():
-    global categoria_queue
-
-    categoria_queue = pick_categories()
-    if not categoria_queue:
-        print("❌ No hay categorías disponibles.")
+    pl = make_playlist(cat)
+    if not pl:
+        print(f"⚠️ Offline/Sync: sin material para {cat}")
+        playing_flag.clear()
         return
 
-    print(f"🟦 Plan de reproducción inicial: {categoria_queue}")
+    print(f"\n🎬 Reproduciendo: {cat}")
+    mpv_play_playlist(pl)
 
-    # hilos independientes
-    threading.Thread(target=broadcast_leader, daemon=True).start()
-    threading.Thread(target=listen_for_followers, daemon=True).start()
-    threading.Thread(target=receive_done, daemon=True).start()
+    if report_done:
+        time.sleep(DONE_DELAY)
+        send_done()
 
-    play_loop()
+    playing_flag.clear()
 
 
-if __name__ == '__main__':
+def register_with_leader():
+    with leader_lock:
+        lip = leader_ip
+    if not lip:
+        return
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.sendto(f"REGISTER:{socket.gethostname()}".encode(), (lip, REG_PORT))
+        print("📡 Registrado con el leader")
+    except Exception:
+        pass
+
+
+def discover_leader_loop():
+    global leader_ip, mode
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("", BCAST_PORT))
+
+    last_seen = 0.0
+
+    while True:
+        data, addr = sock.recvfrom(2048)
+        msg = data.decode(errors="ignore")
+
+        if msg.startswith("LEADER_HERE:"):
+            last_seen = time.time()
+            with leader_lock:
+                changed = (leader_ip != addr[0])
+                leader_ip = addr[0]
+
+            if changed:
+                print(f"👑 Leader detectado: {addr[0]}")
+                register_with_leader()
+
+            # si estábamos offline y vuelve leader => volvemos SYNC
+            with mode_lock:
+                if mode != "SYNC":
+                    mode = "SYNC"
+                    print("🟦 Volviendo a modo SYNC (leader disponible)")
+
+        # watchdog offline
+        if time.time() - last_seen > OFFLINE_AFTER:
+            with mode_lock:
+                if mode != "OFFLINE":
+                    mode = "OFFLINE"
+                    with leader_lock:
+                        leader_ip = None
+                    print("🟧 Modo OFFLINE: no se detecta leader")
+
+
+def listen_commands_loop():
+    global current_category
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("", CMD_PORT))
+    print("👂 Escuchando comandos del leader...")
+
+    while True:
+        data, addr = sock.recvfrom(2048)
+        msg = data.decode(errors="ignore").strip()
+
+        # Solo aceptar comandos si estamos en SYNC y el ip coincide
+        with mode_lock:
+            if mode != "SYNC":
+                continue
+
+        with leader_lock:
+            lip = leader_ip
+        if lip and addr[0] != lip:
+            continue
+
+        if msg.startswith("PLAY:"):
+            cat = msg.split(":", 1)[1]
+
+            with category_lock:
+                same = (cat == current_category)
+
+            if same:
+                continue  # debounce
+
+            threading.Thread(target=play_category, args=(cat, True), daemon=True).start()
+
+        elif msg == "NEXT":
+            print("⏭ NEXT recibido")
+            # No tocamos flags: el siguiente PLAY define el cambio
+
+
+def offline_player_loop():
+    # reproduce random cuando no hay leader
+    while True:
+        with mode_lock:
+            m = mode
+        if m != "OFFLINE":
+            time.sleep(0.5)
+            continue
+
+        cats = list(cache.keys())
+        if not cats:
+            time.sleep(1)
+            continue
+
+        cat = random.choice(cats)
+        # offline: no manda DONE
+        play_category(cat, report_done=False)
+        time.sleep(OFFLINE_GAP)
+
+
+def main():
+    build_cache()
+    ensure_audio()
+
+    threading.Thread(target=discover_leader_loop, daemon=True).start()
+    threading.Thread(target=listen_commands_loop, daemon=True).start()
+    threading.Thread(target=offline_player_loop, daemon=True).start()
+
+    print("🟩 FOLLOWER listo (SYNC/OFFLINE automático).")
+    while True:
+        time.sleep(1)
+
+
+if __name__ == "__main__":
     main()
