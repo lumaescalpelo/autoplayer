@@ -252,12 +252,12 @@ def playlist_manager_video(role: int, orientation: str, stop_evt: threading.Even
         r = ipc.loadlist_replace(m3u_path)
         return bool(r and r.get("error") == "success")
 
-    # espera breve a que mpv cree el socket IPC
-    t0 = time.time()
-    while not stop_evt.is_set() and (not VIDEO_IPC.exists()):
-        if time.time() - t0 > 5:
+    # Esperar a que mpv levante el socket IPC
+    for _ in range(50):  # hasta ~10 segundos
+        if VIDEO_IPC.exists():
             break
-        time.sleep(0.1)
+        time.sleep(0.2)
+
 
     ok = rebuild_and_load()
     if not ok:
