@@ -70,13 +70,19 @@ def list_categories(base_dir: Path) -> list[str]:
     return cats
 
 def category_dirs(cat: str, orientation: str) -> tuple[Path, Path]:
-    # Mantiene compatibilidad con tu script: hor_text y hor
-    # Para vertical: ver_text y ver (ajusta si tu naming real es distinto)
-    if orientation not in ("hor", "ver"):
+    if orientation == "hor":
+        vid_dir  = BASE_VIDEO_DIR / cat / "hor"
+        text_dir = BASE_VIDEO_DIR / cat / "hor_text"
+
+    elif orientation == "ver":
+        vid_dir  = BASE_VIDEO_DIR / cat / "ver_rotated"
+        text_dir = BASE_VIDEO_DIR / cat / "ver_rotated_text"
+
+    else:
         raise ValueError("ORIENTATION debe ser 'hor' o 'ver'")
-    text_dir = BASE_VIDEO_DIR / cat / f"{orientation}_text"
-    vid_dir  = BASE_VIDEO_DIR / cat / orientation
+
     return text_dir, vid_dir
+
 
 def pick_block_for_category(cat: str, orientation: str) -> list[Path]:
     text_dir, vid_dir = category_dirs(cat, orientation)
