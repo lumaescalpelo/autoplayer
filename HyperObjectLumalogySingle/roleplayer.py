@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -------------------------------------------------------
-# Raspberry Pi 4B+ — Autoplayer por playlist (estable)
+# Raspberry Pi 4B+ — Autoplayer por playlist (ESTABLE)
 # -------------------------------------------------------
 
 import random
@@ -126,10 +126,13 @@ def video_loop(stop_evt):
             f"--playlist={PLAYLIST_PATH}",
             "--loop-playlist=no",
 
+            # Flags válidos en Raspberry Pi
             "--hwdec=auto-safe",
             "--vo=gpu",
-            "--profile=fast",
+            "--gpu-context=drm,x11,wayland",
+            "--scale=bilinear",
 
+            # Fullscreen sin barras
             "--panscan=1.0",
             "--no-keepaspect-window",
             "--video-aspect-override=no",
