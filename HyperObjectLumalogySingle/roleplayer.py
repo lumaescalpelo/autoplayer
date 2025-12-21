@@ -129,7 +129,6 @@ def video_loop(stop_evt):
             # Flags válidos en Raspberry Pi
             "--hwdec=auto-safe",
             "--vo=gpu",
-            "--gpu-context=drm,x11,wayland",
             "--scale=bilinear",
 
             # Fullscreen sin barras
