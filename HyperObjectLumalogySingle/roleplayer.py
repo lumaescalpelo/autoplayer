@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -------------------------------------------------------
-# Raspberry Pi 4B+ — Sistema audiovisual robusto
-# Basado en control temporal desde Python (SIN IPC)
+# Raspberry Pi 4B+ — Autoplayer estable por PLAYLIST
+# Un solo mpv por ciclo (sin parpadeo entre videos)
 # -------------------------------------------------------
 
-import os
 import random
 import subprocess
 import time
@@ -16,17 +15,17 @@ from pathlib import Path
 # =======================
 
 ROLE = 0                  # 0=leader, 1..3 followers
-ORIENTATION = "hor"       # "hor" o "ver"
+ORIENTATION = "hor"       # "hor" | "ver"
+
+ROUNDS = 10               # cuántas veces repetir todas las categorías
+VIDEOS_PER_BLOCK = 4      # 1 texto + 3 sin texto
 
 BASE_VIDEO_DIR = Path.home() / "Videos" / "videos_hd_final"
 BASE_AUDIO_DIR = Path.home() / "Music" / "audios"
 
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv")
 
-# Duraciones (segundos)
-BLOCK_DURATION = 40       # duración total por categoría
-VIDEO_DURATION = 10       # duración por video
-BLACK_GAP = 0.2           # negro entre bloques
+PLAYLIST_PATH = Path("/tmp") / f"playlist_role{ROLE}.m3u"
 
 # =======================
 # AUDIO
@@ -54,7 +53,7 @@ def audio_loop(stop_evt):
         time.sleep(1)
 
 # =======================
-# VIDEO
+# VIDEO PLAYLIST
 # =======================
 
 def is_video(p: Path):
@@ -72,61 +71,72 @@ def category_dirs(cat: str):
             BASE_VIDEO_DIR / cat / "ver_rotated",
         )
 
-def pick_block(cat: str):
-    text_dir, vid_dir = category_dirs(cat)
+def build_playlist():
+    categories = [d.name for d in BASE_VIDEO_DIR.iterdir() if d.is_dir()]
+    lines = []
 
-    textos = [p for p in text_dir.iterdir() if is_video(p)] if text_dir.exists() else []
-    vids   = [p for p in vid_dir.iterdir() if is_video(p)] if vid_dir.exists() else []
+    for _ in range(ROUNDS):
+        random.shuffle(categories)
 
-    if not textos or len(vids) < 3:
-        return []
+        for cat in categories:
+            text_dir, vid_dir = category_dirs(cat)
 
-    return [random.choice(textos)] + random.sample(vids, 3)
+            textos = [p for p in text_dir.iterdir() if is_video(p)] if text_dir.exists() else []
+            vids   = [p for p in vid_dir.iterdir() if is_video(p)] if vid_dir.exists() else []
 
-def play_video(path: Path, duration: float):
-    subprocess.run([
-        "mpv",
-        "--fs",
-        "--no-terminal", "--really-quiet",
-        "--panscan=1.0",
-        "--no-keepaspect-window",
-        "--video-aspect-override=no",
-        f"--length={duration}",
-        str(path)
-    ])
+            if not textos or len(vids) < 3:
+                continue
 
-def play_black(duration: float):
-    subprocess.run([
-        "mpv",
-        "--fs",
-        "--no-terminal", "--really-quiet",
-        "--vid=no",
-        "--vo=gpu",
-        f"--length={duration}"
-    ])
+            block = [random.choice(textos)] + random.sample(vids, 3)
+            for v in block:
+                lines.append(str(v))
+
+    return lines
+
+def write_playlist():
+    lines = build_playlist()
+    if not lines:
+        return False
+
+    with PLAYLIST_PATH.open("w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")
+
+    print(f"📼 Playlist creada: {len(lines)} videos")
+    return True
+
+# =======================
+# VIDEO LOOP
+# =======================
 
 def video_loop(stop_evt):
-    categories = [d.name for d in BASE_VIDEO_DIR.iterdir() if d.is_dir()]
-
     while not stop_evt.is_set():
-        cat = random.choice(categories)
-        block = pick_block(cat)
-
-        if not block:
-            time.sleep(0.2)
+        if not write_playlist():
+            time.sleep(1)
             continue
 
-        start = time.time()
-        for video in block:
-            elapsed = time.time() - start
-            remaining = BLOCK_DURATION - elapsed
-            if remaining <= 0:
-                break
+        print("🎬 Lanzando mpv (playlist única)")
+        proc = subprocess.Popen([
+            "mpv",
+            "--fs",
+            "--no-terminal", "--really-quiet",
 
-            play_video(video, min(VIDEO_DURATION, remaining))
+            f"--playlist={PLAYLIST_PATH}",
+            "--loop-playlist=no",
 
-        # negro entre bloques (oculta escritorio)
-        play_black(BLACK_GAP)
+            "--hwdec=auto-safe",
+            "--vo=gpu",
+            "--profile=fast",
+
+            "--panscan=1.0",
+            "--no-keepaspect-window",
+            "--video-aspect-override=no",
+
+            "--stop-screensaver=yes",
+        ])
+
+        proc.wait()   # espera a que termine TODA la playlist
+        print("🔁 Playlist terminada, regenerando")
 
 # =======================
 # MAIN
@@ -138,7 +148,7 @@ def main():
     threading.Thread(target=audio_loop, args=(stop,), daemon=True).start()
     threading.Thread(target=video_loop, args=(stop,), daemon=True).start()
 
-    print(f"✅ Sistema corriendo | ROLE={ROLE} | ORIENTATION={ORIENTATION}")
+    print(f"✅ Autoplayer activo | ROLE={ROLE} | ORIENTATION={ORIENTATION}")
 
     try:
         while True:
