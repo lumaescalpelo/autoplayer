@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -------------------------------------------------------
-# Raspberry Pi 4B+ — Autoplayer por playlist (FINAL)
+# Raspberry Pi 4B+ — Autoplayer por playlist (FINAL Bookworm)
 # -------------------------------------------------------
 
 import random
@@ -15,21 +15,19 @@ from pathlib import Path
 
 ROLE = 0                  # 0 = leader, 1..3 followers
 ORIENTATION = "hor"       # "hor" | "ver"
-
 ROUNDS = 10               # cuántas veces repetir todas las categorías
 
 BASE_VIDEO_DIR = Path.home() / "Videos" / "videos_hd_final"
 BASE_AUDIO_DIR = Path.home() / "Music" / "audios"
 
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv")
-
 PLAYLIST_PATH = Path("/tmp") / f"playlist_role{ROLE}.m3u"
 
 # =======================
 # AUDIO
 # =======================
 
-def pick_audio():
+def pick_audio() -> Path:
     return BASE_AUDIO_DIR / {
         0: "drone_81.WAV",
         1: "drone_82.WAV",
@@ -37,7 +35,7 @@ def pick_audio():
         3: "drone_84.WAV",
     }[ROLE]
 
-def audio_loop(stop_evt):
+def audio_loop(stop_evt: threading.Event) -> None:
     proc = None
     while not stop_evt.is_set():
         if proc is None or proc.poll() is not None:
@@ -55,10 +53,11 @@ def audio_loop(stop_evt):
 # VIDEO PLAYLIST
 # =======================
 
-def is_video(p: Path):
+def is_video(p: Path) -> bool:
     return p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
 
 def category_dirs(cat: str):
+    # Nombres reales que me diste
     if ORIENTATION == "hor":
         return (
             BASE_VIDEO_DIR / cat / "hor_text",
@@ -87,29 +86,28 @@ def build_playlist():
                 continue
 
             block = [random.choice(textos)] + random.sample(vids, 3)
-            for v in block:
-                lines.append(str(v))
+            lines.extend(str(v) for v in block)
 
     return lines
 
-def write_playlist():
+def write_playlist() -> bool:
     lines = build_playlist()
     if not lines:
-        print("❌ Playlist vacía")
+        print("❌ Playlist vacía (no hay categorías con >=1 texto y >=3 videos)")
         return False
 
     with PLAYLIST_PATH.open("w", encoding="utf-8") as f:
         for line in lines:
             f.write(line + "\n")
 
-    print(f"📼 Playlist creada: {len(lines)} videos")
+    print(f"📼 Playlist creada: {len(lines)} videos -> {PLAYLIST_PATH}")
     return True
 
 # =======================
 # VIDEO LOOP
 # =======================
 
-def video_loop(stop_evt):
+def video_loop(stop_evt: threading.Event) -> None:
     while not stop_evt.is_set():
         if not write_playlist():
             time.sleep(1)
@@ -126,14 +124,18 @@ def video_loop(stop_evt):
             f"--playlist={PLAYLIST_PATH}",
             "--loop-playlist=no",
 
-            # Flags válidos y estables en Raspberry Pi
+            # Rendimiento Pi (Bookworm-friendly)
             "--hwdec=auto-safe",
             "--vo=gpu",
             "--scale=bilinear",
 
-            # 🔥 FILL TOTAL (sin barras negras)
+            # FILL total sin barras:
+            # Esto recorta (crop) para llenar pantalla.
             "--video-zoom=0.999",
-            "--video-pan=0:0",
+
+            # Si quieres dejarlo explícito (opcional):
+            "--video-pan-x=0",
+            "--video-pan-y=0",
 
             "--stop-screensaver=yes",
         ])
@@ -145,7 +147,7 @@ def video_loop(stop_evt):
 # MAIN
 # =======================
 
-def main():
+def main() -> None:
     stop = threading.Event()
 
     threading.Thread(target=audio_loop, args=(stop,), daemon=True).start()
