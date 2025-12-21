@@ -1,26 +1,14 @@
 #!/usr/bin/env python3
 # -------------------------------------------------------
 # Raspberry Pi 4B+ — Sistema audiovisual Leader / Followers
-#
-# Video:
-#   - mpv único, fullscreen real, sin barras (panscan)
-#   - Playlist regenerativa vía IPC (sin usar idle-active)
-#
-# Audio:
-#   - Loop infinito por rol (watchdog)
-#
-# Compatible con:
-#   hor / hor_text
-#   ver_rotated / ver_rotated_text
+# SOLUCIÓN FINAL: mpv + playlist-watch (SIN IPC)
 # -------------------------------------------------------
 
 import time
-import json
 import random
 import subprocess
 import threading
 from pathlib import Path
-import socket
 
 # =======================
 # CONFIGURACIÓN
@@ -38,8 +26,7 @@ BASE_AUDIO_DIR = Path.home() / "Music" / "audios"
 
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv")
 
-VIDEO_IPC = Path("/tmp") / f"mpv_video_role{ROLE}.sock"
-TMP_PLAYLIST = Path("/tmp") / f"playlist_role{ROLE}.m3u"
+PLAYLIST_PATH = Path("/tmp") / f"playlist_role{ROLE}.m3u"
 DEBUG_PLAYLIST = Path.home() / f"video_system_last_playlist_role{ROLE}.m3u"
 
 # =======================
@@ -88,7 +75,7 @@ def pick_block(cat: str):
     return random.sample(text_v, 1) + random.sample(vid_v, 3)
 
 def build_playlist():
-    result = []
+    blocks = []
     cats = list_categories()
 
     for _ in range(ROUNDS):
@@ -96,11 +83,11 @@ def build_playlist():
         for cat in cats:
             block = pick_block(cat)
             if block:
-                result.append((cat, block))
+                blocks.append((cat, block))
             else:
                 print(f"⚠️  Categoría omitida: {cat}")
 
-    return result
+    return blocks
 
 def write_m3u(blocks, path):
     with path.open("w", encoding="utf-8") as f:
@@ -108,44 +95,6 @@ def write_m3u(blocks, path):
             f.write(f"# === {cat} ===\n")
             for v in vids:
                 f.write(str(v) + "\n")
-
-# =======================
-# MPV IPC
-# =======================
-
-class MPVIPC:
-    def __init__(self, sock):
-        self.sock = sock
-
-    def cmd(self, payload):
-        try:
-            with socket.socket(socket.AF_UNIX) as s:
-                s.settimeout(1)
-                s.connect(str(self.sock))
-                s.sendall((json.dumps(payload) + "\n").encode())
-                data = s.recv(4096)
-            for line in data.splitlines():
-                try:
-                    return json.loads(line)
-                except Exception:
-                    pass
-        except Exception:
-            return None
-
-    def ready(self):
-        r = self.cmd({"command": ["get_property", "pid"]})
-        return r and r.get("error") == "success"
-
-    def loadlist(self, path):
-        return self.cmd({"command": ["loadlist", str(path), "replace"]})
-
-def wait_for_ipc_ready(ipc, timeout=15):
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        if ipc.ready():
-            return True
-        time.sleep(0.3)
-    return False
 
 # =======================
 # MPV PROCESOS
@@ -161,24 +110,23 @@ def launch_audio():
     ])
 
 def launch_video():
-    if VIDEO_IPC.exists():
-        VIDEO_IPC.unlink()
-
     return subprocess.Popen([
         "mpv",
         "--no-terminal", "--quiet",
         "--fs",
         "--force-window=yes",
-        "--idle=yes",
-        "--keep-open=yes",
-        "--input-ipc-server=" + str(VIDEO_IPC),
 
-        # Rendimiento Raspberry Pi
+        # Playlist dinámica
+        f"--playlist={PLAYLIST_PATH}",
+        "--playlist-watch=yes",
+        "--loop-playlist=no",
+
+        # Rendimiento Pi
         "--hwdec=auto-safe",
         "--vo=gpu",
         "--profile=fast",
 
-        # Pantalla completa SIN barras
+        # Fullscreen SIN barras
         "--panscan=1.0",
         "--no-keepaspect-window",
         "--video-aspect-override=no",
@@ -199,64 +147,44 @@ def audio_loop(stop):
         time.sleep(1)
 
 def video_loop(stop):
-    proc = launch_video()
+    proc = None
 
-    # Esperar socket IPC
-    for _ in range(60):
-        if VIDEO_IPC.exists():
-            break
-        time.sleep(0.2)
-
-    ipc = MPVIPC(VIDEO_IPC)
-
-    def rebuild():
+    def regenerate_playlist():
         blocks = build_playlist()
         if not blocks:
             print("❌ Playlist vacía")
             return False
 
-        write_m3u(blocks, TMP_PLAYLIST)
+        write_m3u(blocks, PLAYLIST_PATH)
         write_m3u(blocks, DEBUG_PLAYLIST)
 
-        if not wait_for_ipc_ready(ipc):
-            print("❌ mpv IPC no respondió")
-            return False
-
-        r = ipc.loadlist(TMP_PLAYLIST)
-        if not r or r.get("error") != "success":
-            print("❌ mpv rechazó loadlist", r)
-            return False
-
-        print(f"✔ Playlist cargada ({len(blocks)} bloques)")
+        print(f"✔ Playlist escrita ({len(blocks)} bloques)")
         return True
 
-    while not rebuild():
+    # generar playlist inicial
+    while not regenerate_playlist():
         time.sleep(1)
 
-    idle_since = None
+    proc = launch_video()
+    print("🎬 mpv video lanzado")
+
+    # loop principal
+    last_size = PLAYLIST_PATH.stat().st_size
 
     while not stop.is_set():
         if proc.poll() is not None:
             print("🎬 mpv murió, relanzando")
             proc = launch_video()
             time.sleep(1)
-            ipc = MPVIPC(VIDEO_IPC)
-            rebuild()
-            idle_since = None
 
-        # Detectar fin de playlist: mpv vuelve a no tener archivo
-        playing = ipc.cmd({"command": ["get_property", "filename"]})
-        if not playing or playing.get("data") is None:
-            if idle_since is None:
-                idle_since = time.time()
-            elif time.time() - idle_since > 1.0:
-                print("🔁 Playlist terminada, regenerando")
-                rebuild()
-                idle_since = None
-        else:
-            idle_since = None
+        # detectar fin de playlist por tamaño estable y mpv sin archivos
+        time.sleep(2)
 
-        time.sleep(0.5)
+        # regenerar periódicamente cuando mpv termine
+        if proc.poll() is None:
+            regenerate_playlist()
+
+        time.sleep(5)
 
 # =======================
 # MAIN
