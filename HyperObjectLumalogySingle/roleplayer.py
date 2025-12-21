@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -------------------------------------------------------
-# Raspberry Pi 4B+ — Autoplayer estable por PLAYLIST
-# Un solo mpv por ciclo (sin parpadeo entre videos)
+# Raspberry Pi 4B+ — Autoplayer por playlist (estable)
 # -------------------------------------------------------
 
 import random
@@ -14,11 +13,10 @@ from pathlib import Path
 # CONFIG
 # =======================
 
-ROLE = 0                  # 0=leader, 1..3 followers
+ROLE = 0                  # 0 = leader, 1..3 followers
 ORIENTATION = "hor"       # "hor" | "ver"
 
 ROUNDS = 10               # cuántas veces repetir todas las categorías
-VIDEOS_PER_BLOCK = 4      # 1 texto + 3 sin texto
 
 BASE_VIDEO_DIR = Path.home() / "Videos" / "videos_hd_final"
 BASE_AUDIO_DIR = Path.home() / "Music" / "audios"
@@ -43,9 +41,10 @@ def audio_loop(stop_evt):
     proc = None
     while not stop_evt.is_set():
         if proc is None or proc.poll() is not None:
+            print("🔊 Lanzando audio")
             proc = subprocess.Popen([
                 "mpv",
-                "--no-terminal", "--quiet",
+                "--no-terminal",
                 "--loop-file=inf",
                 "--audio-display=no",
                 str(pick_audio())
@@ -96,6 +95,7 @@ def build_playlist():
 def write_playlist():
     lines = build_playlist()
     if not lines:
+        print("❌ Playlist vacía")
         return False
 
     with PLAYLIST_PATH.open("w", encoding="utf-8") as f:
@@ -115,11 +115,13 @@ def video_loop(stop_evt):
             time.sleep(1)
             continue
 
-        print("🎬 Lanzando mpv (playlist única)")
+        print("🎬 Lanzando mpv con playlist")
         proc = subprocess.Popen([
             "mpv",
+
             "--fs",
-            "--no-terminal", "--really-quiet",
+            "--force-window=yes",
+            "--keep-open=yes",
 
             f"--playlist={PLAYLIST_PATH}",
             "--loop-playlist=no",
@@ -135,7 +137,7 @@ def video_loop(stop_evt):
             "--stop-screensaver=yes",
         ])
 
-        proc.wait()   # espera a que termine TODA la playlist
+        proc.wait()
         print("🔁 Playlist terminada, regenerando")
 
 # =======================
