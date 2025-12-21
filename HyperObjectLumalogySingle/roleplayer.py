@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 # -------------------------------------------------------
 # Raspberry Pi 4B+ — Sistema audiovisual Leader / Followers
+#
 # Video:
 #   - mpv único, fullscreen real, sin barras (panscan)
-#   - playlist regenerativa vía IPC
+#   - Playlist regenerativa vía IPC (sin usar idle-active)
+#
 # Audio:
-#   - loop infinito por rol (watchdog)
+#   - Loop infinito por rol (watchdog)
+#
+# Compatible con:
+#   hor / hor_text
+#   ver_rotated / ver_rotated_text
 # -------------------------------------------------------
 
 import time
@@ -17,10 +23,10 @@ from pathlib import Path
 import socket
 
 # =======================
-# CONFIG
+# CONFIGURACIÓN
 # =======================
 
-ROLE = 0                  # 0=leader, 1..3 followers
+ROLE = 0                  # 0 = leader, 1 / 2 / 3 = followers
 ORIENTATION = "hor"       # "hor" o "ver"
 
 ROUNDS = 10
@@ -37,7 +43,7 @@ TMP_PLAYLIST = Path("/tmp") / f"playlist_role{ROLE}.m3u"
 DEBUG_PLAYLIST = Path.home() / f"video_system_last_playlist_role{ROLE}.m3u"
 
 # =======================
-# UTIL
+# UTILIDADES
 # =======================
 
 def is_video(p: Path) -> bool:
@@ -56,7 +62,7 @@ def pick_audio(role: int) -> Path:
 # =======================
 
 def list_categories():
-    return sorted([d.name for d in BASE_VIDEO_DIR.iterdir() if d.is_dir()])
+    return sorted(d.name for d in BASE_VIDEO_DIR.iterdir() if d.is_dir())
 
 def category_dirs(cat: str):
     if ORIENTATION == "hor":
@@ -79,8 +85,7 @@ def pick_block(cat: str):
     if len(text_v) < BLOCK_TEXT_COUNT or len(vid_v) < BLOCK_NO_TEXT_COUNT:
         return []
 
-    block = random.sample(text_v, 1) + random.sample(vid_v, 3)
-    return block
+    return random.sample(text_v, 1) + random.sample(vid_v, 3)
 
 def build_playlist():
     result = []
@@ -93,7 +98,7 @@ def build_playlist():
             if block:
                 result.append((cat, block))
             else:
-                print(f"⚠️  Omitida: {cat}")
+                print(f"⚠️  Categoría omitida: {cat}")
 
     return result
 
@@ -127,19 +132,19 @@ class MPVIPC:
         except Exception:
             return None
 
-    def idle(self):
-        r = self.cmd({"command": ["get_property", "idle-active"]})
-        return r and r.get("data") is True
+    def ready(self):
+        r = self.cmd({"command": ["get_property", "pid"]})
+        return r and r.get("error") == "success"
 
     def loadlist(self, path):
         return self.cmd({"command": ["loadlist", str(path), "replace"]})
 
-def wait_idle(ipc, timeout=15):
+def wait_for_ipc_ready(ipc, timeout=15):
     t0 = time.time()
     while time.time() - t0 < timeout:
-        if ipc.idle():
+        if ipc.ready():
             return True
-        time.sleep(0.25)
+        time.sleep(0.3)
     return False
 
 # =======================
@@ -168,12 +173,12 @@ def launch_video():
         "--keep-open=yes",
         "--input-ipc-server=" + str(VIDEO_IPC),
 
-        # Render / rendimiento
+        # Rendimiento Raspberry Pi
         "--hwdec=auto-safe",
         "--vo=gpu",
         "--profile=fast",
 
-        # SIN BARRAS (clave)
+        # Pantalla completa SIN barras
         "--panscan=1.0",
         "--no-keepaspect-window",
         "--video-aspect-override=no",
@@ -189,14 +194,14 @@ def audio_loop(stop):
     proc = None
     while not stop.is_set():
         if proc is None or proc.poll() is not None:
-            print("🔊 Audio lanzado")
+            print("🔊 Audio iniciado")
             proc = launch_audio()
         time.sleep(1)
 
 def video_loop(stop):
     proc = launch_video()
 
-    # esperar socket
+    # Esperar socket IPC
     for _ in range(60):
         if VIDEO_IPC.exists():
             break
@@ -207,18 +212,19 @@ def video_loop(stop):
     def rebuild():
         blocks = build_playlist()
         if not blocks:
+            print("❌ Playlist vacía")
             return False
 
         write_m3u(blocks, TMP_PLAYLIST)
         write_m3u(blocks, DEBUG_PLAYLIST)
 
-        if not wait_idle(ipc):
-            print("❌ mpv no llegó a idle")
+        if not wait_for_ipc_ready(ipc):
+            print("❌ mpv IPC no respondió")
             return False
 
         r = ipc.loadlist(TMP_PLAYLIST)
         if not r or r.get("error") != "success":
-            print("❌ loadlist falló", r)
+            print("❌ mpv rechazó loadlist", r)
             return False
 
         print(f"✔ Playlist cargada ({len(blocks)} bloques)")
@@ -238,11 +244,13 @@ def video_loop(stop):
             rebuild()
             idle_since = None
 
-        if ipc.idle():
+        # Detectar fin de playlist: mpv vuelve a no tener archivo
+        playing = ipc.cmd({"command": ["get_property", "filename"]})
+        if not playing or playing.get("data") is None:
             if idle_since is None:
                 idle_since = time.time()
             elif time.time() - idle_since > 1.0:
-                print("🔁 Regenerando playlist")
+                print("🔁 Playlist terminada, regenerando")
                 rebuild()
                 idle_since = None
         else:
