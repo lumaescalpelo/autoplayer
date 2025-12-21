@@ -1,77 +1,150 @@
+#!/usr/bin/env python3
+# -------------------------------------------------------
+# Raspberry Pi 4B+ — Sistema audiovisual robusto
+# Basado en control temporal desde Python (SIN IPC)
+# -------------------------------------------------------
+
 import os
 import random
 import subprocess
 import time
+import threading
+from pathlib import Path
 
-# Ruta base donde están las carpetas de categorías
-BASE_PATH = "/ruta/a/tus/videos"  # <- Modifica con la ruta real
-DURACION_CATEGORIA = 40  # Segundos totales por categoría
-DURACION_VIDEO_PROMEDIO = 10  # Duración estimada por video
-DURACION_MINIMA_VIDEO = 10  # Tiempo mínimo para cada video
+# =======================
+# CONFIG
+# =======================
 
-def obtener_videos(categoria):
-    """ Obtiene videos de la categoría recibida """
-    categoria_path = os.path.join(BASE_PATH, categoria)
-    texto_path = os.path.join(categoria_path, "texto")
-    video_path = os.path.join(categoria_path, "video")
+ROLE = 0                  # 0=leader, 1..3 followers
+ORIENTATION = "hor"       # "hor" o "ver"
 
-    videos_texto = [os.path.join(texto_path, v) for v in os.listdir(texto_path) if v.endswith(('.mp4', '.avi', '.mkv'))] if os.path.exists(texto_path) else []
-    videos_video = [os.path.join(video_path, v) for v in os.listdir(video_path) if v.endswith(('.mp4', '.avi', '.mkv'))] if os.path.exists(video_path) else []
+BASE_VIDEO_DIR = Path.home() / "Videos" / "videos_hd_final"
+BASE_AUDIO_DIR = Path.home() / "Music" / "audios"
 
-    if not videos_video:
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv")
+
+# Duraciones (segundos)
+BLOCK_DURATION = 40       # duración total por categoría
+VIDEO_DURATION = 10       # duración por video
+BLACK_GAP = 0.2           # negro entre bloques
+
+# =======================
+# AUDIO
+# =======================
+
+def pick_audio():
+    return BASE_AUDIO_DIR / {
+        0: "drone_81.WAV",
+        1: "drone_82.WAV",
+        2: "drone_83.WAV",
+        3: "drone_84.WAV",
+    }[ROLE]
+
+def audio_loop(stop_evt):
+    proc = None
+    while not stop_evt.is_set():
+        if proc is None or proc.poll() is not None:
+            proc = subprocess.Popen([
+                "mpv",
+                "--no-terminal", "--quiet",
+                "--loop-file=inf",
+                "--audio-display=no",
+                str(pick_audio())
+            ])
+        time.sleep(1)
+
+# =======================
+# VIDEO
+# =======================
+
+def is_video(p: Path):
+    return p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
+
+def category_dirs(cat: str):
+    if ORIENTATION == "hor":
+        return (
+            BASE_VIDEO_DIR / cat / "hor_text",
+            BASE_VIDEO_DIR / cat / "hor",
+        )
+    else:
+        return (
+            BASE_VIDEO_DIR / cat / "ver_rotated_text",
+            BASE_VIDEO_DIR / cat / "ver_rotated",
+        )
+
+def pick_block(cat: str):
+    text_dir, vid_dir = category_dirs(cat)
+
+    textos = [p for p in text_dir.iterdir() if is_video(p)] if text_dir.exists() else []
+    vids   = [p for p in vid_dir.iterdir() if is_video(p)] if vid_dir.exists() else []
+
+    if not textos or len(vids) < 3:
         return []
 
-    video_texto = random.choice(videos_texto) if videos_texto else None
-    lista_videos = [video_texto] if video_texto else []
+    return [random.choice(textos)] + random.sample(vids, 3)
 
-    # Seleccionar aleatoriamente videos hasta llenar el tiempo
-    duracion_actual = 0
-    while duracion_actual < DURACION_CATEGORIA:
-        video = random.choice(videos_video)
-        lista_videos.append(video)
-        duracion_actual += DURACION_VIDEO_PROMEDIO
+def play_video(path: Path, duration: float):
+    subprocess.run([
+        "mpv",
+        "--fs",
+        "--no-terminal", "--really-quiet",
+        "--panscan=1.0",
+        "--no-keepaspect-window",
+        "--video-aspect-override=no",
+        f"--length={duration}",
+        str(path)
+    ])
 
-    return lista_videos
+def play_black(duration: float):
+    subprocess.run([
+        "mpv",
+        "--fs",
+        "--no-terminal", "--really-quiet",
+        "--vid=no",
+        "--vo=gpu",
+        f"--length={duration}"
+    ])
 
-def reproducir_video(video, duracion_restante):
-    """ Reproduce un video, cortándolo si es más largo o agregando pantalla negra si es más corto """
-    print(f"🎥 Reproduciendo: {video} | Tiempo disponible: {duracion_restante:.1f} s")
+def video_loop(stop_evt):
+    categories = [d.name for d in BASE_VIDEO_DIR.iterdir() if d.is_dir()]
 
-    # Intentar reproducir el video con la duración exacta
-    subprocess.run(["mpv", "--fs", "--really-quiet", "--no-terminal", "--length=" + str(duracion_restante), video])
+    while not stop_evt.is_set():
+        cat = random.choice(categories)
+        block = pick_block(cat)
 
-    # Si el video dura menos de 10s, poner pantalla en negro el tiempo faltante
-    if duracion_restante > DURACION_MINIMA_VIDEO:
-        print(f"🖤 Pantalla negra por {duracion_restante - DURACION_MINIMA_VIDEO:.1f} s")
-        subprocess.run(["mpv", "--fs", "--really-quiet", "--no-terminal", "--length=" + str(duracion_restante - DURACION_MINIMA_VIDEO), "--vid=no", "--vo=gpu"])
+        if not block:
+            time.sleep(0.2)
+            continue
 
-def reproducir_videos(lista_videos):
-    """ Reproduce los videos y ajusta el tiempo total a 40s """
-    tiempo_inicio = time.time()
+        start = time.time()
+        for video in block:
+            elapsed = time.time() - start
+            remaining = BLOCK_DURATION - elapsed
+            if remaining <= 0:
+                break
 
-    for video in lista_videos:
-        tiempo_restante = DURACION_CATEGORIA - (time.time() - tiempo_inicio)
+            play_video(video, min(VIDEO_DURATION, remaining))
 
-        if tiempo_restante <= 0:
-            break  # Detener si ya pasaron los 40s
+        # negro entre bloques (oculta escritorio)
+        play_black(BLACK_GAP)
 
-        reproducir_video(video, min(tiempo_restante, DURACION_VIDEO_PROMEDIO))
+# =======================
+# MAIN
+# =======================
 
 def main():
-    categorias = [cat for cat in os.listdir(BASE_PATH) if os.path.isdir(os.path.join(BASE_PATH, cat))]
+    stop = threading.Event()
 
-    while True:
-        categoria = random.choice(categorias)
-        print(f"\n🔄 Cambiando a categoría: {categoria}")
+    threading.Thread(target=audio_loop, args=(stop,), daemon=True).start()
+    threading.Thread(target=video_loop, args=(stop,), daemon=True).start()
 
-        videos_a_reproducir = obtener_videos(categoria)
+    print(f"✅ Sistema corriendo | ROLE={ROLE} | ORIENTATION={ORIENTATION}")
 
-        if videos_a_reproducir:
-            reproducir_videos(videos_a_reproducir)
-        else:
-            print(f"⚠️ No hay suficientes videos en {categoria}")
-
-        time.sleep(0.5)  # Pequeña pausa antes de la siguiente categoría
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        stop.set()
 
 if __name__ == "__main__":
     main()
