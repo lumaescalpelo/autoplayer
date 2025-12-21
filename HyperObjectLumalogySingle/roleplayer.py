@@ -1,44 +1,42 @@
 #!/usr/bin/env python3
 # -------------------------------------------------------
-# RPi 4B+ — Leader/Follower (ROLE) — audio loop + video mpv único
-# - ROLE=0: leader audio drone_81.WAV
-# - ROLE=1..3: follower audio drone_82/83/84.WAV
-# - Playlist larga: 10 rondas aleatorizando categorías
-# - Bloque por categoría: 1 video con texto + 3 sin texto
-# - mpv de video NO se cierra: usa IPC para recargar playlist al terminar
-# - Watchdogs: si muere mpv audio o video, se relanza
+# Raspberry Pi 4B+ — Sistema audiovisual Leader / Followers
+# - Audio infinito por rol (watchdog)
+# - Video en una sola instancia mpv (IPC)
+# - Playlist larga, regenerativa y observable
+# - Compatible con hor / hor_text / ver_rotated / ver_rotated_text
 # -------------------------------------------------------
 
 import os
 import time
 import json
 import random
-import socket
 import subprocess
 import threading
 from pathlib import Path
+import socket
 
 # =======================
 # CONFIG PRINCIPAL
 # =======================
 
-ROLE = 0  # 0=leader, 1/2/3=followers
+ROLE = 0                  # 0=leader, 1,2,3=followers
+ORIENTATION = "hor"       # "hor" o "ver"
 
-# "hor" o "ver"
-ORIENTATION = "hor"
-
-ROUNDS = 10                 # cuántas veces barajar todas las categorías
-BLOCK_TEXT_COUNT = 1        # 1 video con texto
-BLOCK_NO_TEXT_COUNT = 3     # 3 videos sin texto
+ROUNDS = 10
+BLOCK_TEXT_COUNT = 1
+BLOCK_NO_TEXT_COUNT = 3
 
 BASE_VIDEO_DIR = Path.home() / "Videos" / "videos_hd_final"
 BASE_AUDIO_DIR = Path.home() / "Music" / "audios"
 
-VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv")  # por si hay mkv
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv")
 
-# IPC sockets (uno por rol, para poder correr 4 raspis iguales)
 IPC_DIR = Path("/tmp")
 VIDEO_IPC = IPC_DIR / f"mpv_video_role{ROLE}.sock"
+
+DEBUG_PLAYLIST_PATH = Path.home() / f"video_system_last_playlist_role{ROLE}.m3u"
+TMP_PLAYLIST_PATH   = Path("/tmp") / f"playlist_role{ROLE}.m3u"
 
 # =======================
 # UTILIDADES
@@ -47,115 +45,102 @@ VIDEO_IPC = IPC_DIR / f"mpv_video_role{ROLE}.sock"
 def is_video_file(p: Path) -> bool:
     return p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
 
-def safe_mkdir(p: Path):
-    p.mkdir(parents=True, exist_ok=True)
-
 def pick_audio_by_role(role: int) -> Path:
-    # leader=81, followers: 82/83/84
-    mapping = {0: "drone_81.WAV", 1: "drone_82.WAV", 2: "drone_83.WAV", 3: "drone_84.WAV"}
-    name = mapping.get(role)
-    if not name:
+    mapping = {
+        0: "drone_81.WAV",
+        1: "drone_82.WAV",
+        2: "drone_83.WAV",
+        3: "drone_84.WAV",
+    }
+    if role not in mapping:
         raise ValueError("ROLE inválido (usa 0..3)")
-    return BASE_AUDIO_DIR / name
+    return BASE_AUDIO_DIR / mapping[role]
 
 # =======================
-# SCAN DE CATEGORÍAS
+# CATEGORÍAS
 # =======================
 
 def list_categories(base_dir: Path) -> list[str]:
-    if not base_dir.is_dir():
-        raise FileNotFoundError(f"No existe BASE_VIDEO_DIR: {base_dir}")
-    cats = [d.name for d in base_dir.iterdir() if d.is_dir()]
-    cats.sort()
-    return cats
+    return sorted([d.name for d in base_dir.iterdir() if d.is_dir()])
 
 def category_dirs(cat: str, orientation: str) -> tuple[Path, Path]:
     if orientation == "hor":
-        vid_dir  = BASE_VIDEO_DIR / cat / "hor"
         text_dir = BASE_VIDEO_DIR / cat / "hor_text"
-
+        vid_dir  = BASE_VIDEO_DIR / cat / "hor"
     elif orientation == "ver":
-        vid_dir  = BASE_VIDEO_DIR / cat / "ver_rotated"
         text_dir = BASE_VIDEO_DIR / cat / "ver_rotated_text"
-
+        vid_dir  = BASE_VIDEO_DIR / cat / "ver_rotated"
     else:
         raise ValueError("ORIENTATION debe ser 'hor' o 'ver'")
-
     return text_dir, vid_dir
-
 
 def pick_block_for_category(cat: str, orientation: str) -> list[Path]:
     text_dir, vid_dir = category_dirs(cat, orientation)
 
-    text_candidates = [p for p in text_dir.iterdir()] if text_dir.is_dir() else []
-    text_candidates = [p for p in text_candidates if is_video_file(p)]
+    text_videos = []
+    video_videos = []
 
-    vid_candidates = [p for p in vid_dir.iterdir()] if vid_dir.is_dir() else []
-    vid_candidates = [p for p in vid_candidates if is_video_file(p)]
+    if text_dir.is_dir():
+        text_videos = [p for p in text_dir.iterdir() if is_video_file(p)]
+    if vid_dir.is_dir():
+        video_videos = [p for p in vid_dir.iterdir() if is_video_file(p)]
 
-    if len(text_candidates) < BLOCK_TEXT_COUNT:
+    if len(text_videos) < BLOCK_TEXT_COUNT:
         return []
-    if len(vid_candidates) < BLOCK_NO_TEXT_COUNT:
+    if len(video_videos) < BLOCK_NO_TEXT_COUNT:
         return []
 
     block = []
-    block.extend(random.sample(text_candidates, BLOCK_TEXT_COUNT))
-    block.extend(random.sample(vid_candidates, BLOCK_NO_TEXT_COUNT))
+    block.extend(random.sample(text_videos, BLOCK_TEXT_COUNT))
+    block.extend(random.sample(video_videos, BLOCK_NO_TEXT_COUNT))
     return block
 
-def build_long_playlist(orientation: str) -> list[Path]:
+def build_long_playlist(orientation: str) -> list[tuple[str, list[Path]]]:
     cats = list_categories(BASE_VIDEO_DIR)
-    if not cats:
-        return []
+    result: list[tuple[str, list[Path]]] = []
 
-    playlist: list[Path] = []
     for _ in range(ROUNDS):
-        round_cats = cats[:]
-        random.shuffle(round_cats)
-
-        for cat in round_cats:
+        shuffled = cats[:]
+        random.shuffle(shuffled)
+        for cat in shuffled:
             block = pick_block_for_category(cat, orientation)
-            # Si una categoría está “incompleta”, la saltamos en esta ronda.
             if block:
-                playlist.extend(block)
+                result.append((cat, block))
+            else:
+                print(f"⚠️  Categoría omitida (faltan videos): {cat}")
 
-    return playlist
+    return result
 
-def write_m3u(paths: list[Path], out_path: Path):
-    # mpv tolera rutas con espacios si van línea por línea
+def write_m3u(blocks: list[tuple[str, list[Path]]], out_path: Path):
     with out_path.open("w", encoding="utf-8") as f:
-        for p in paths:
-            f.write(str(p) + "\n")
+        for cat, paths in blocks:
+            f.write(f"# === {cat} ===\n")
+            for p in paths:
+                f.write(str(p) + "\n")
 
 # =======================
-# MPV IPC (JSON)
+# MPV IPC
 # =======================
 
 class MPVIPC:
     def __init__(self, sock_path: Path):
         self.sock_path = sock_path
 
-    def _send(self, obj: dict) -> dict | None:
-        # mpv IPC: una línea JSON por comando, respuesta por línea
-        import socket as pysock
+    def _send(self, obj: dict):
         msg = (json.dumps(obj) + "\n").encode("utf-8")
-
         try:
-            with pysock.socket(pysock.AF_UNIX, pysock.SOCK_STREAM) as s:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
                 s.settimeout(1.0)
                 s.connect(str(self.sock_path))
                 s.sendall(msg)
                 data = s.recv(65536)
             if not data:
                 return None
-            # mpv puede mandar múltiples líneas; tomamos la primera JSON válida
-            lines = data.splitlines()
-            for ln in lines:
+            for line in data.splitlines():
                 try:
-                    return json.loads(ln.decode("utf-8", errors="ignore"))
+                    return json.loads(line.decode())
                 except Exception:
-                    continue
-            return None
+                    pass
         except Exception:
             return None
 
@@ -165,45 +150,38 @@ class MPVIPC:
             return r.get("data")
         return None
 
-    def loadlist_replace(self, m3u_path: Path):
-        # "loadlist <path> replace"
-        return self._send({"command": ["loadlist", str(m3u_path), "replace"]})
+    def loadlist_replace(self, path: Path):
+        return self._send({"command": ["loadlist", str(path), "replace"]})
 
 # =======================
-# PROCESOS: AUDIO Y VIDEO
+# MPV PROCESOS
 # =======================
 
 def launch_audio_mpv(audio_path: Path) -> subprocess.Popen:
-    # Audio infinito, sin video, silencioso
-    cmd = [
+    return subprocess.Popen([
         "mpv",
         "--no-terminal", "--quiet",
         "--loop-file=inf",
         "--audio-display=no",
         str(audio_path),
-    ]
-    return subprocess.Popen(cmd)
+    ])
 
 def launch_video_mpv(ipc_path: Path) -> subprocess.Popen:
-    # Video fullscreen, ventana forzada, con IPC para recargar playlists
-    # Ajustes “seguros” para RPi: hwdec auto (si hay accel la usa),
-    # y evitamos cosas pesadas. 1080p debería ir bien si el decode está ok.
     if ipc_path.exists():
         try:
             ipc_path.unlink()
         except Exception:
             pass
 
-    cmd = [
+    return subprocess.Popen([
         "mpv",
         "--no-terminal", "--quiet",
         "--fs",
         "--force-window=yes",
         "--idle=yes",
-        "--keep-open=no",
+        "--keep-open=yes",
         "--input-ipc-server=" + str(ipc_path),
 
-        # Rendimiento / fluidez:
         "--hwdec=auto-safe",
         "--vo=gpu",
         "--profile=fast",
@@ -213,80 +191,87 @@ def launch_video_mpv(ipc_path: Path) -> subprocess.Popen:
         "--framedrop=vo",
         "--video-sync=display-resample",
         "--interpolation=no",
-
-        # Evitar screensaver/DPMS si aplica:
         "--stop-screensaver=yes",
-    ]
-    return subprocess.Popen(cmd)
+    ])
 
 # =======================
-# WATCHDOGS
+# WATCHDOG AUDIO
 # =======================
 
-def watchdog_audio(role: int, stop_evt: threading.Event):
-    audio_path = pick_audio_by_role(role)
-    if not audio_path.is_file():
-        raise FileNotFoundError(f"No existe el audio requerido: {audio_path}")
-
+def audio_watchdog(stop_evt: threading.Event):
+    audio = pick_audio_by_role(ROLE)
     proc = None
+
     while not stop_evt.is_set():
         if proc is None or proc.poll() is not None:
-            proc = launch_audio_mpv(audio_path)
-        time.sleep(1.0)
+            print("🔊 Lanzando audio:", audio)
+            proc = launch_audio_mpv(audio)
+        time.sleep(1)
 
-def playlist_manager_video(role: int, orientation: str, stop_evt: threading.Event):
-    # 1) levanta mpv video una vez
+# =======================
+# VIDEO + PLAYLIST MANAGER
+# =======================
+
+def video_manager(stop_evt: threading.Event):
     proc = launch_video_mpv(VIDEO_IPC)
-    ipc = MPVIPC(VIDEO_IPC)
 
-    # 2) carga primera playlist
-    safe_mkdir(Path("/tmp"))
-    m3u_path = Path(f"/tmp/playlist_role{role}.m3u")
-
-    def rebuild_and_load():
-        paths = build_long_playlist(orientation)
-        if not paths:
-            print("⚠️ Playlist vacía (revisa carpetas/estructura). Reintentando…")
-            return False
-        write_m3u(paths, m3u_path)
-        r = ipc.loadlist_replace(m3u_path)
-        return bool(r and r.get("error") == "success")
-
-    # Esperar a que mpv levante el socket IPC
-    for _ in range(50):  # hasta ~10 segundos
+    # esperar IPC
+    for _ in range(50):
         if VIDEO_IPC.exists():
             break
         time.sleep(0.2)
 
+    ipc = MPVIPC(VIDEO_IPC)
 
-    ok = rebuild_and_load()
-    if not ok:
-        print("⚠️ No se pudo cargar la playlist al inicio. Se reintentará.")
+    def rebuild_and_load():
+        blocks = build_long_playlist(ORIENTATION)
+        if not blocks:
+            print("❌ Playlist vacía")
+            return False
 
-    # 3) loop: cuando mpv está idle (playlist terminó), regenerar y recargar
+        write_m3u(blocks, DEBUG_PLAYLIST_PATH)
+        write_m3u(blocks, TMP_PLAYLIST_PATH)
+
+        # garantizar que el archivo esté escrito
+        if not TMP_PLAYLIST_PATH.exists() or TMP_PLAYLIST_PATH.stat().st_size == 0:
+            print("❌ Playlist no escrita correctamente")
+            return False
+
+        print(f"✔ Playlist lista ({len(blocks)} bloques)")
+        time.sleep(0.2)
+
+        r = ipc.loadlist_replace(TMP_PLAYLIST_PATH)
+        if not r or r.get("error") != "success":
+            print("❌ mpv rechazó loadlist")
+            return False
+
+        return True
+
+    # primera carga (espera hasta que funcione)
+    while not rebuild_and_load():
+        print("⏳ Reintentando carga inicial…")
+        time.sleep(1)
+
     idle_since = None
 
     while not stop_evt.is_set():
-        # si mpv murió, lo relanzamos (y recargamos playlist)
         if proc.poll() is not None:
+            print("🎬 mpv murió, relanzando")
             proc = launch_video_mpv(VIDEO_IPC)
+            time.sleep(1)
             ipc = MPVIPC(VIDEO_IPC)
-            time.sleep(0.5)
             rebuild_and_load()
             idle_since = None
-            time.sleep(1.0)
             continue
 
         idle = ipc.get_property("idle-active")
-        # idle-active True cuando mpv está en idle sin archivo
-        if idle is True:
+        if idle:
             if idle_since is None:
                 idle_since = time.time()
-            # dale un margen pequeño para evitar falsa detección
-            if time.time() - idle_since > 0.8:
-                # regenerar playlist (nueva aleatorización) y reemplazar
-                if rebuild_and_load():
-                    idle_since = None
+            elif time.time() - idle_since > 1.0:
+                print("🔁 Playlist terminada, regenerando")
+                rebuild_and_load()
+                idle_since = None
         else:
             idle_since = None
 
@@ -297,28 +282,24 @@ def playlist_manager_video(role: int, orientation: str, stop_evt: threading.Even
 # =======================
 
 def main():
+    if not BASE_VIDEO_DIR.is_dir():
+        raise RuntimeError("BASE_VIDEO_DIR no existe")
+    if not BASE_AUDIO_DIR.is_dir():
+        raise RuntimeError("BASE_AUDIO_DIR no existe")
+
     stop_evt = threading.Event()
 
-    # sanity checks
-    if not BASE_VIDEO_DIR.is_dir():
-        raise FileNotFoundError(f"No existe: {BASE_VIDEO_DIR}")
-    if not BASE_AUDIO_DIR.is_dir():
-        raise FileNotFoundError(f"No existe: {BASE_AUDIO_DIR}")
+    threading.Thread(target=audio_watchdog, args=(stop_evt,), daemon=True).start()
+    threading.Thread(target=video_manager, args=(stop_evt,), daemon=True).start()
 
-    # threads
-    ta = threading.Thread(target=watchdog_audio, args=(ROLE, stop_evt), daemon=True)
-    tv = threading.Thread(target=playlist_manager_video, args=(ROLE, ORIENTATION, stop_evt), daemon=True)
+    print(f"✅ Sistema corriendo | ROLE={ROLE} | ORIENTATION={ORIENTATION}")
 
-    ta.start()
-    tv.start()
-
-    print(f"✅ Running ROLE={ROLE} ORIENTATION={ORIENTATION} (audio loop + video mpv IPC). Ctrl+C para salir.")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         stop_evt.set()
-        time.sleep(0.5)
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()
