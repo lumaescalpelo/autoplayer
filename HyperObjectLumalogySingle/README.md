@@ -203,14 +203,27 @@ nano ~/.bashrc
 Agrega **al final del archivo**:
 
 ```bash
-# --- Sistema audiovisual mpv ---
-if [[ -z "$DISPLAY" ]]; then
-    export DISPLAY=:0
+# ==============================
+# AUTOPLAYER MPV (SAFE MODE)
+# ==============================
+
+# Solo arrancar si existe la bandera
+if [ -f "$HOME/.autoplayer_enable" ]; then
+
+    # Evitar múltiples instancias
+    if ! pgrep -f "roleplayer.py" >/dev/null; then
+
+        # Asegurar DISPLAY solo si no existe
+        if [ -z "$DISPLAY" ]; then
+            export DISPLAY=:0
+        fi
+
+        # Lanzar en background y sin ensuciar la terminal
+        nohup python3 /home/pi/Documents/GitHub/autoplayer/HyperObjectLumalogySingle/roleplayer.py \
+            >/tmp/autoplayer.log 2>&1 &
+
+    fi
 fi
-
-sleep 5
-
-python3 /home/<usuario>/video_system.py &
 ```
 
 Guarda y cierra.
