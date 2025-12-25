@@ -15,9 +15,9 @@ from pathlib import Path
 # =======================
 
 ROLE = 0  # 0 = leader, 1..3 followers
-ORIENTATION = "hor"  # hor | ver | inverted_hor | inverted_ver
+ORIENTATION = "inverted_ver"  # hor | ver | inverted_hor | inverted_ver
 
-ROUNDS = 999999  # prácticamente infinito
+ROUNDS = 100  # prácticamente infinito
 
 BASE_VIDEO_DIR = Path.home() / "Videos" / "videos_hd_final"
 BASE_AUDIO_DIR = Path.home() / "Music" / "audios"

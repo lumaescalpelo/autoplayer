@@ -38,12 +38,12 @@ ORIENTATION_MAP = {
         "video_dir": "hor",
     },
     "ver": {
-        "rotation": 90,
+        "rotation": 0,
         "text_dir": "ver_rotated_text",
         "video_dir": "ver_rotated",
     },
     "inverted_hor": {
-        "rotation": 0,
+        "rotation": 180,
         "text_dir": "hor_text",
         "video_dir": "hor",
     },
