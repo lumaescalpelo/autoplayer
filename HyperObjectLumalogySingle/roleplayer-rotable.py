@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -------------------------------------------------------
-# Raspberry Pi 4B+ — Autoplayer por playlist (FINAL Bookworm)
+# Raspberry Pi 4B+ — Autoplayer mpv (rotación de pantalla)
 # -------------------------------------------------------
 
 import random
@@ -13,9 +13,13 @@ from pathlib import Path
 # CONFIG
 # =======================
 
-ROLE = 0                  # 0 = leader, 1..3 followers
-ORIENTATION = "hor"       # "hor" | "ver"
-ROUNDS = 10               # cuántas veces repetir todas las categorías
+ROLE = 0   # 0 = leader, 1..3 followers
+
+# Orientación física de la pantalla
+# hor | ver | inverted_hor | inverted_ver
+ORIENTATION = "hor"
+
+ROUNDS = 10
 
 BASE_VIDEO_DIR = Path.home() / "Videos" / "videos_hd_final"
 BASE_AUDIO_DIR = Path.home() / "Music" / "audios"
@@ -24,10 +28,37 @@ VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv")
 PLAYLIST_PATH = Path("/tmp") / f"playlist_role{ROLE}.m3u"
 
 # =======================
+# ORIENTATION MAP
+# =======================
+
+ORIENTATION_MAP = {
+    "hor": {
+        "rotation": 0,
+        "text_dir": "hor_text",
+        "video_dir": "hor",
+    },
+    "ver": {
+        "rotation": 90,
+        "text_dir": "ver_rotated_text",
+        "video_dir": "ver_rotated",
+    },
+    "inverted_hor": {
+        "rotation": 180,
+        "text_dir": "hor_text",
+        "video_dir": "hor",
+    },
+    "inverted_ver": {
+        "rotation": 270,
+        "text_dir": "ver_rotated_text",
+        "video_dir": "ver_rotated",
+    },
+}
+
+# =======================
 # AUDIO
 # =======================
 
-def pick_audio() -> Path:
+def pick_audio():
     return BASE_AUDIO_DIR / {
         0: "drone_81.WAV",
         1: "drone_82.WAV",
@@ -35,11 +66,10 @@ def pick_audio() -> Path:
         3: "drone_84.WAV",
     }[ROLE]
 
-def audio_loop(stop_evt: threading.Event) -> None:
+def audio_loop(stop_evt):
     proc = None
     while not stop_evt.is_set():
         if proc is None or proc.poll() is not None:
-            print("🔊 Lanzando audio")
             proc = subprocess.Popen([
                 "mpv",
                 "--no-terminal",
@@ -53,21 +83,15 @@ def audio_loop(stop_evt: threading.Event) -> None:
 # VIDEO PLAYLIST
 # =======================
 
-def is_video(p: Path) -> bool:
+def is_video(p: Path):
     return p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
 
 def category_dirs(cat: str):
-    # Nombres reales que me diste
-    if ORIENTATION == "hor":
-        return (
-            BASE_VIDEO_DIR / cat / "hor_text",
-            BASE_VIDEO_DIR / cat / "hor",
-        )
-    else:
-        return (
-            BASE_VIDEO_DIR / cat / "ver_rotated_text",
-            BASE_VIDEO_DIR / cat / "ver_rotated",
-        )
+    cfg = ORIENTATION_MAP[ORIENTATION]
+    return (
+        BASE_VIDEO_DIR / cat / cfg["text_dir"],
+        BASE_VIDEO_DIR / cat / cfg["video_dir"],
+    )
 
 def build_playlist():
     categories = [d.name for d in BASE_VIDEO_DIR.iterdir() if d.is_dir()]
@@ -75,7 +99,6 @@ def build_playlist():
 
     for _ in range(ROUNDS):
         random.shuffle(categories)
-
         for cat in categories:
             text_dir, vid_dir = category_dirs(cat)
 
@@ -90,30 +113,33 @@ def build_playlist():
 
     return lines
 
-def write_playlist() -> bool:
+def write_playlist():
     lines = build_playlist()
     if not lines:
-        print("❌ Playlist vacía (no hay categorías con >=1 texto y >=3 videos)")
+        print("❌ Playlist vacía")
         return False
 
     with PLAYLIST_PATH.open("w", encoding="utf-8") as f:
         for line in lines:
             f.write(line + "\n")
 
-    print(f"📼 Playlist creada: {len(lines)} videos -> {PLAYLIST_PATH}")
+    print(f"📼 Playlist creada: {len(lines)} videos")
     return True
 
 # =======================
 # VIDEO LOOP
 # =======================
 
-def video_loop(stop_evt: threading.Event) -> None:
+def video_loop(stop_evt):
+    rotation = ORIENTATION_MAP[ORIENTATION]["rotation"]
+
     while not stop_evt.is_set():
         if not write_playlist():
             time.sleep(1)
             continue
 
-        print("🎬 Lanzando mpv con playlist")
+        print(f"🎬 Lanzando mpv | rotación={rotation}°")
+
         proc = subprocess.Popen([
             "mpv",
 
@@ -124,18 +150,17 @@ def video_loop(stop_evt: threading.Event) -> None:
             f"--playlist={PLAYLIST_PATH}",
             "--loop-playlist=no",
 
-            # Rendimiento Pi (Bookworm-friendly)
             "--hwdec=auto-safe",
             "--vo=gpu",
             "--scale=bilinear",
 
-            # FILL total sin barras:
-            # Esto recorta (crop) para llenar pantalla.
-            "--video-zoom=0.999",
+            # Rotación física de pantalla
+            f"--video-rotate={rotation}",
 
-            # Si quieres dejarlo explícito (opcional):
-            "--video-pan-x=0",
-            "--video-pan-y=0",
+            # Fill suave (el que decidiste mantener)
+            "--panscan=1.0",
+            "--no-keepaspect-window",
+            "--video-aspect-override=no",
 
             "--stop-screensaver=yes",
         ])
@@ -147,7 +172,7 @@ def video_loop(stop_evt: threading.Event) -> None:
 # MAIN
 # =======================
 
-def main() -> None:
+def main():
     stop = threading.Event()
 
     threading.Thread(target=audio_loop, args=(stop,), daemon=True).start()
