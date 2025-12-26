@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -------------------------------------------------------
-# Raspberry Pi 4B+ — Autoplayer robusto + UDP autosync
+# Raspberry Pi 4B+ — Autoplayer mpv
+# Standalone robusto + sincronización UDP por categoría
 # -------------------------------------------------------
 
 import json
@@ -18,9 +19,9 @@ from typing import List, Optional
 # CONFIG
 # =======================
 
-ROLE = 0                  # 0=leader, 1..3=follower
-ORIENTATION = "hor"
-ROUNDS = 100
+ROLE = 0                  # 0 = leader, 1..3 followers
+ORIENTATION = "hor"       # hor | ver | inverted_hor | inverted_ver
+ROUNDS = 100              # repeticiones de todas las categorías
 
 BASE_VIDEO_DIR = Path.home() / "Videos" / "videos_hd_final"
 BASE_AUDIO_DIR = Path.home() / "Music" / "audios"
@@ -32,7 +33,7 @@ CMD_PORT   = 9001
 DONE_PORT  = 9100
 LEADER_TIMEOUT = 5.0
 
-# IPC
+# MPV / IPC
 IPC_SOCKET = f"/tmp/mpv_roleplayer_{ROLE}.sock"
 BLOCK_SIZE = 4
 
@@ -41,72 +42,93 @@ BLOCK_SIZE = 4
 # =======================
 
 ORIENTATION_MAP = {
-    "hor": {"rotation": 0, "text_dir": "hor_text", "video_dir": "hor"},
-    "ver": {"rotation": 0, "text_dir": "ver_rotated_text", "video_dir": "ver_rotated"},
-    "inverted_hor": {"rotation": 180, "text_dir": "hor_text", "video_dir": "hor"},
-    "inverted_ver": {"rotation": 180, "text_dir": "ver_rotated_text", "video_dir": "ver_rotated"},
+    "hor": {
+        "rotation": 0,
+        "text_dir": "hor_text",
+        "video_dir": "hor",
+    },
+    "ver": {
+        "rotation": 0,  # videos ya rotados
+        "text_dir": "ver_rotated_text",
+        "video_dir": "ver_rotated",
+    },
+    "inverted_hor": {
+        "rotation": 180,
+        "text_dir": "hor_text",
+        "video_dir": "hor",
+    },
+    "inverted_ver": {
+        "rotation": 180,
+        "text_dir": "ver_rotated_text",
+        "video_dir": "ver_rotated",
+    },
 }
 
 # =======================
 # GLOBAL STATE
 # =======================
 
-mode_lock = threading.Lock()
-mode = "STANDALONE"     # STANDALONE | SYNCED
+stop_evt = threading.Event()
 
-leader_ip = None
+mode_lock = threading.Lock()
+mode = "STANDALONE"   # STANDALONE | SYNCED
+
+leader_ip: Optional[str] = None
 last_leader_seen = 0.0
 
-current_category = None
 category_lock = threading.Lock()
-
-stop_evt = threading.Event()
+current_category: Optional[str] = None
 
 # =======================
 # LOG
 # =======================
 
-def log(msg):
+def log(msg: str):
     print(msg, flush=True)
 
 # =======================
-# FILES
+# FILES / CATEGORIES
 # =======================
 
-def is_video(p: Path):
+def is_video(p: Path) -> bool:
     return p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
 
-def category_dirs(cat):
+def category_dirs(cat: str):
     cfg = ORIENTATION_MAP[ORIENTATION]
     return (
         BASE_VIDEO_DIR / cat / cfg["text_dir"],
         BASE_VIDEO_DIR / cat / cfg["video_dir"],
     )
 
-def pick_block(cat):
+def pick_block(cat: str) -> List[Path]:
     text_dir, vid_dir = category_dirs(cat)
+
     textos = [p for p in text_dir.iterdir() if is_video(p)] if text_dir.exists() else []
     vids   = [p for p in vid_dir.iterdir() if is_video(p)] if vid_dir.exists() else []
+
     if not textos or len(vids) < 3:
         return []
+
     return [random.choice(textos)] + random.sample(vids, 3)
 
-def all_categories():
+def all_categories() -> List[str]:
+    if not BASE_VIDEO_DIR.exists():
+        return []
     return [d.name for d in BASE_VIDEO_DIR.iterdir() if d.is_dir()]
 
-def build_category_playlist():
+def build_category_playlist() -> List[str]:
     cats = all_categories()
-    out = []
+    playlist: List[str] = []
     for _ in range(ROUNDS):
         random.shuffle(cats)
-        out.extend(cats)
-    return out
+        playlist.extend(cats)
+    return playlist
 
 # =======================
 # AUDIO
 # =======================
 
-def pick_audio():
+def pick_audio() -> Path:
     return BASE_AUDIO_DIR / {
         0: "drone_81.WAV",
         1: "drone_82.WAV",
@@ -129,16 +151,138 @@ def audio_loop():
         time.sleep(1)
 
 # =======================
-# MPV IPC (reutilizamos núcleo estable)
+# MPV IPC (ROBUSTO)
 # =======================
 
-# ---- (MISMO MPVIPC, start_mpv_video, mpv_load_block, wait_block)
-# ---- OMITO COMENTARIOS AQUÍ POR BREVEDAD
-# ---- ES EXACTAMENTE EL MISMO NÚCLEO QUE YA PROBASTE
-# ---- NO SE MODIFICA
+class MPVIPC:
+    def __init__(self, sock_path: str):
+        self.sock_path = sock_path
+        self.sock: Optional[socket.socket] = None
+        self.lock = threading.Lock()
+        self.req_id = 0
 
-# (Por razones de espacio, asumo que sigues usando
-#  EXACTAMENTE las funciones IPC estables del archivo anterior)
+        self.endfile_lock = threading.Lock()
+        self.endfile_count = 0
+
+        self.responses = {}
+        self.cv = threading.Condition()
+
+    def connect(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(self.sock_path)
+        self.sock = s
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        buf = b""
+        while not stop_evt.is_set():
+            try:
+                data = self.sock.recv(4096)
+                if not data:
+                    time.sleep(0.05)
+                    continue
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    msg = json.loads(line.decode(errors="ignore"))
+                    if msg.get("event") == "end-file":
+                        with self.endfile_lock:
+                            self.endfile_count += 1
+                    elif "request_id" in msg:
+                        with self.cv:
+                            self.responses[msg["request_id"]] = msg
+                            self.cv.notify_all()
+            except:
+                time.sleep(0.05)
+
+    def cmd(self, command: List, timeout=3.0):
+        with self.lock:
+            self.req_id += 1
+            rid = self.req_id
+            payload = {"command": command, "request_id": rid}
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+
+        deadline = time.time() + timeout
+        with self.cv:
+            while time.time() < deadline:
+                if rid in self.responses:
+                    return self.responses.pop(rid)
+                self.cv.wait(0.1)
+        return {"error": "timeout"}
+
+    def reset_endfiles(self):
+        with self.endfile_lock:
+            self.endfile_count = 0
+
+    def wait_block(self):
+        while True:
+            with self.endfile_lock:
+                if self.endfile_count >= BLOCK_SIZE:
+                    return
+            time.sleep(0.05)
+
+# =======================
+# MPV START / STOP
+# =======================
+
+def kill_old_mpv():
+    try:
+        subprocess.run(["pkill", "-9", "mpv"], stdout=subprocess.DEVNULL)
+    except:
+        pass
+    try:
+        os.remove(IPC_SOCKET)
+    except:
+        pass
+
+def start_mpv() -> MPVIPC:
+    kill_old_mpv()
+
+    rot = ORIENTATION_MAP[ORIENTATION]["rotation"]
+
+    subprocess.Popen([
+        "mpv",
+        "--idle=yes",
+        "--fs",
+        "--force-window=yes",
+        "--keep-open=yes",
+        "--no-terminal",
+        "--quiet",
+        "--hwdec=drm-copy",
+        "--vd=no",
+        "--vo=gpu",
+        "--scale=bilinear",
+        f"--video-rotate={rot}",
+        "--panscan=1.0",
+        "--stop-screensaver=yes",
+        f"--input-ipc-server={IPC_SOCKET}",
+    ])
+
+    for _ in range(100):
+        if os.path.exists(IPC_SOCKET):
+            break
+        time.sleep(0.1)
+
+    ipc = MPVIPC(IPC_SOCKET)
+    ipc.connect()
+    return ipc
+
+# =======================
+# MPV BLOCK LOAD
+# =======================
+
+def mpv_play_block(ipc: MPVIPC, block: List[Path]):
+    ipc.reset_endfiles()
+
+    ipc.cmd(["set_property", "pause", True])
+    ipc.cmd(["playlist-clear"])
+
+    ipc.cmd(["loadfile", str(block[0]), "replace"])
+    for p in block[1:]:
+        ipc.cmd(["loadfile", str(p), "append"])
+
+    ipc.cmd(["set_property", "playlist-pos", 0])
+    ipc.cmd(["set_property", "pause", False])
 
 # =======================
 # UDP NETWORK
@@ -162,16 +306,16 @@ def udp_listen_leader():
         if data == b"LEADER_HERE":
             leader_ip = addr[0]
             last_leader_seen = time.time()
-            with mode_lock:
-                if ROLE != 0:
+            if ROLE != 0:
+                with mode_lock:
                     mode = "SYNCED"
 
-def udp_listen_commands():
+def udp_listen_cmd():
     global current_category
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(("", CMD_PORT))
     while not stop_evt.is_set():
-        data, addr = s.recvfrom(1024)
+        data, _ = s.recvfrom(1024)
         msg = data.decode()
         if msg.startswith("PLAY:"):
             cat = msg.split(":", 1)[1]
@@ -187,7 +331,7 @@ def udp_send_done():
 # MAIN PLAYBACK LOOP
 # =======================
 
-def playback_loop(ipc):
+def playback_loop(ipc: MPVIPC):
     global current_category
 
     local_playlist = build_category_playlist()
@@ -214,18 +358,20 @@ def playback_loop(ipc):
         if not block:
             continue
 
-        log(f"[{ROLE}] ▶ {cat}")
-        mpv_load_block(ipc, block)
-        ipc.wait_block_done(BLOCK_SIZE)
+        log(f"[ROLE {ROLE}] ▶ {cat}")
+        mpv_play_block(ipc, block)
+        ipc.wait_block()
 
         if m == "SYNCED" and ROLE != 0:
             udp_send_done()
 
         if ROLE == 0 and m == "SYNCED":
-            # leader decide next
-            current_category = random.choice(all_categories())
+            next_cat = random.choice(all_categories())
+            with category_lock:
+                current_category = next_cat
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.sendto(f"PLAY:{current_category}".encode(), ("255.255.255.255", CMD_PORT))
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(f"PLAY:{next_cat}".encode(), ("255.255.255.255", CMD_PORT))
 
 # =======================
 # MAIN
@@ -237,10 +383,10 @@ def main():
 
     threading.Thread(target=audio_loop, daemon=True).start()
 
-    ipc = start_mpv_video()
+    ipc = start_mpv()
 
     threading.Thread(target=udp_listen_leader, daemon=True).start()
-    threading.Thread(target=udp_listen_commands, daemon=True).start()
+    threading.Thread(target=udp_listen_cmd, daemon=True).start()
 
     if ROLE == 0:
         threading.Thread(target=udp_broadcast_loop, daemon=True).start()
