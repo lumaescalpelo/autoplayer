@@ -2,6 +2,7 @@
 # -------------------------------------------------------
 # Raspberry Pi 4B+ — Autoplayer mpv
 # Standalone robusto + sincronización UDP por categoría
+# BLOQUES CORREGIDOS: 4 videos, texto en posición aleatoria
 # -------------------------------------------------------
 
 import json
@@ -101,15 +102,30 @@ def category_dirs(cat: str):
     )
 
 def pick_block(cat: str) -> List[Path]:
+    """
+    Devuelve SIEMPRE un bloque de 4 videos:
+    - mínimo 1 con texto
+    - 3 sin texto
+    - orden completamente aleatorio
+    """
     text_dir, vid_dir = category_dirs(cat)
 
     textos = [p for p in text_dir.iterdir() if is_video(p)] if text_dir.exists() else []
     vids   = [p for p in vid_dir.iterdir() if is_video(p)] if vid_dir.exists() else []
 
-    if not textos or len(vids) < 3:
+    if len(textos) < 1 or len(vids) < 3:
         return []
 
-    return [random.choice(textos)] + random.sample(vids, 3)
+    try:
+        block = [
+            random.choice(textos),
+            *random.sample(vids, 3),
+        ]
+    except ValueError:
+        return []
+
+    random.shuffle(block)  # 🔥 texto en posición aleatoria
+    return block
 
 def all_categories() -> List[str]:
     if not BASE_VIDEO_DIR.exists():
@@ -151,7 +167,7 @@ def audio_loop():
         time.sleep(1)
 
 # =======================
-# MPV IPC (ROBUSTO)
+# MPV IPC
 # =======================
 
 class MPVIPC:
@@ -222,7 +238,7 @@ class MPVIPC:
             time.sleep(0.05)
 
 # =======================
-# MPV START / STOP
+# MPV START
 # =======================
 
 def kill_old_mpv():
@@ -268,12 +284,14 @@ def start_mpv() -> MPVIPC:
     return ipc
 
 # =======================
-# MPV BLOCK LOAD
+# MPV BLOCK PLAY
 # =======================
 
 def mpv_play_block(ipc: MPVIPC, block: List[Path]):
-    ipc.reset_endfiles()
+    if len(block) != BLOCK_SIZE:
+        return
 
+    ipc.reset_endfiles()
     ipc.cmd(["set_property", "pause", True])
     ipc.cmd(["playlist-clear"])
 
@@ -355,7 +373,7 @@ def playback_loop(ipc: MPVIPC):
                 continue
 
         block = pick_block(cat)
-        if not block:
+        if len(block) != BLOCK_SIZE:
             continue
 
         log(f"[ROLE {ROLE}] ▶ {cat}")
