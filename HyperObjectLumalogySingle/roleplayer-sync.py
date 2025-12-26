@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -------------------------------------------------------
-# Raspberry Pi 4B+ — Autoplayer SYNC por categoría (UDP)
-# - mpv video persistente (IPC JSON), sin flashes de escritorio
-# - mpv audio independiente por ROLE
-# - Modo AUTO (sin leader): playlist de categorías 100 rondas
-# - Modo SYNC (con leader): leader define categoría; todos eligen 4 vids aleatorios
-# - DONE (primer fin): fuerza salto a siguiente categoría
+# Raspberry Pi 4B+ — Autoplayer robusto (standalone + UDP sync)
+# FIXES CLAVE:
+# 1) IPC persistente con request_id (orden garantizado, sin “solo 1 video”)
+# 2) Limpieza de mpv viejo (sin necesitar reboot para volver a correr)
+# 3) mpv video nunca se cierra (no flashes)
+# 4) audio independiente por ROLE (loop infinito)
 # -------------------------------------------------------
 
 import json
@@ -15,6 +15,7 @@ import socket
 import subprocess
 import threading
 import time
+import signal
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -30,46 +31,26 @@ BASE_VIDEO_DIR = Path.home() / "Videos" / "videos_hd_final"
 BASE_AUDIO_DIR = Path.home() / "Music" / "audios"
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv")
 
-# UDP ports
-BCAST_PORT = 8888      # leader heartbeat: "LEADER_HERE"
-REG_PORT   = 8899      # follower -> leader: "REGISTER:<host>:ROLE=<n>"
-CMD_PORT   = 9001      # leader -> all: "PLAY:<idx>"
-DONE_PORT  = 9100      # follower -> leader: "DONE:<idx>"
+# UDP ports (se usarán cuando conectes followers)
+BCAST_PORT = 8888
+REG_PORT   = 8899
+CMD_PORT   = 9001
+DONE_PORT  = 9100
+LEADER_TIMEOUT = 6.0
 
-LEADER_TIMEOUT = 6.0   # follower: si no ve leader en X segundos, vuelve a AUTO
-
-# IPC socket
+# IPC
 IPC_SOCKET = f"/tmp/mpv_roleplayer_{ROLE}.sock"
-
-# reproducción
-BLOCK_SIZE = 4  # 1 texto + 3 sin texto
-POLL_DT = 0.05
+BLOCK_SIZE = 4
 
 # =======================
 # ORIENTATION MAP
 # =======================
 
 ORIENTATION_MAP = {
-    "hor": {
-        "rotation": 0,
-        "text_dir": "hor_text",
-        "video_dir": "hor",
-    },
-    "ver": {
-        "rotation": 0,  # videos verticales ya vienen rotados
-        "text_dir": "ver_rotated_text",
-        "video_dir": "ver_rotated",
-    },
-    "inverted_hor": {
-        "rotation": 180,
-        "text_dir": "hor_text",
-        "video_dir": "hor",
-    },
-    "inverted_ver": {
-        "rotation": 180,
-        "text_dir": "ver_rotated_text",
-        "video_dir": "ver_rotated",
-    },
+    "hor": {"rotation": 0, "text_dir": "hor_text", "video_dir": "hor"},
+    "ver": {"rotation": 0, "text_dir": "ver_rotated_text", "video_dir": "ver_rotated"},
+    "inverted_hor": {"rotation": 180, "text_dir": "hor_text", "video_dir": "hor"},
+    "inverted_ver": {"rotation": 180, "text_dir": "ver_rotated_text", "video_dir": "ver_rotated"},
 }
 
 # =======================
@@ -97,7 +78,6 @@ def pick_block(cat: str) -> List[Path]:
     text_dir, vid_dir = category_dirs(cat)
     textos = [p for p in text_dir.iterdir() if is_video(p)] if text_dir.exists() else []
     vids   = [p for p in vid_dir.iterdir() if is_video(p)] if vid_dir.exists() else []
-
     if not textos or len(vids) < 3:
         return []
     return [random.choice(textos)] + random.sample(vids, 3)
@@ -118,7 +98,7 @@ def build_category_playlist() -> List[str]:
     return out
 
 # =======================
-# AUDIO (independiente)
+# AUDIO
 # =======================
 
 def pick_audio() -> Path:
@@ -147,398 +127,286 @@ def audio_loop(stop_evt: threading.Event):
         time.sleep(1)
 
 # =======================
-# MPV VIDEO IPC (persistente)
+# MPV IPC (persistente, robusto)
 # =======================
 
-class MPVController:
+class MPVIPC:
+    """
+    UNA conexión persistente que:
+    - envía comandos con request_id
+    - lee líneas JSON (eventos + respuestas mezcladas)
+    - devuelve respuesta correcta por request_id
+    - cuenta end-file para saber cuándo termina el bloque
+    """
     def __init__(self, sock_path: str):
         self.sock_path = sock_path
-        self.cmd_lock = threading.Lock()
+        self.sock: Optional[socket.socket] = None
+
+        self._lock = threading.Lock()
+        self._req_id = 0
+
+        self._resp_lock = threading.Lock()
+        self._resp_cv = threading.Condition(self._resp_lock)
+        self._responses = {}  # request_id -> resp dict
+
+        self._stop_evt = threading.Event()
 
         self.endfile_lock = threading.Lock()
         self.endfile_count = 0
 
-        self.block_lock = threading.Lock()
-        self.block_target = BLOCK_SIZE
-
-        self._stop_evt = threading.Event()
-
-    def start_mpv(self):
-        if os.path.exists(self.sock_path):
-            os.remove(self.sock_path)
-
-        rot = ORIENTATION_MAP[ORIENTATION]["rotation"]
-
-        subprocess.Popen([
-            "mpv",
-            "--idle=yes",
-            "--fs",
-            "--force-window=yes",
-            "--keep-open=yes",
-            "--no-terminal",
-            "--quiet",
-            "--hwdec=drm-copy",
-            "--vd=no",
-            "--vo=gpu",
-            "--scale=bilinear",
-            f"--video-rotate={rot}",
-            "--panscan=1.0",
-            "--stop-screensaver=yes",
-            f"--input-ipc-server={self.sock_path}",
-        ])
-
-        # espera socket
-        for _ in range(120):
-            if os.path.exists(self.sock_path):
-                break
-            time.sleep(0.1)
-        else:
-            raise RuntimeError("mpv IPC no apareció")
-
-        # arranca listener de eventos
-        threading.Thread(target=self._event_loop, daemon=True).start()
-        log("MPV", "mpv video listo + listener eventos activo")
-
-    def stop(self):
-        self._stop_evt.set()
-
-    def _send_cmd(self, cmd_obj: dict):
-        data = (json.dumps(cmd_obj) + "\n").encode("utf-8")
+    def connect(self, timeout: float = 3.0):
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
         s.connect(self.sock_path)
-        s.sendall(data)
-        s.close()
+        s.settimeout(None)
+        self.sock = s
+        threading.Thread(target=self._reader_loop, daemon=True).start()
 
-    def cmd(self, command: list):
-        # fire-and-forget (más estable; no dependemos de respuestas)
-        with self.cmd_lock:
-            self._send_cmd({"command": command})
+    def close(self):
+        self._stop_evt.set()
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
 
-    def _event_loop(self):
-        """
-        Conexión persistente que recibe eventos JSON.
-        Contamos end-file para saber cuándo termina un bloque de 4.
-        """
+    def _reader_loop(self):
         buf = b""
         while not self._stop_evt.is_set():
             try:
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                s.connect(self.sock_path)
-                s.settimeout(1.0)
-
-                while not self._stop_evt.is_set():
-                    try:
-                        chunk = s.recv(4096)
-                        if not chunk:
-                            break
-                        buf += chunk
-                        while b"\n" in buf:
-                            line, buf = buf.split(b"\n", 1)
-                            if not line.strip():
-                                continue
-                            try:
-                                evt = json.loads(line.decode("utf-8", errors="ignore"))
-                            except Exception:
-                                continue
-                            if evt.get("event") == "end-file":
-                                with self.endfile_lock:
-                                    self.endfile_count += 1
-                    except socket.timeout:
+                chunk = self.sock.recv(4096)  # type: ignore
+                if not chunk:
+                    time.sleep(0.05)
+                    continue
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if not line.strip():
                         continue
-                s.close()
-            except Exception:
-                time.sleep(0.2)
+                    try:
+                        msg = json.loads(line.decode("utf-8", errors="ignore"))
+                    except Exception:
+                        continue
 
-    def reset_endfile_counter(self):
+                    # eventos
+                    if isinstance(msg, dict) and msg.get("event") == "end-file":
+                        with self.endfile_lock:
+                            self.endfile_count += 1
+                        continue
+
+                    # respuestas a request_id
+                    rid = msg.get("request_id") if isinstance(msg, dict) else None
+                    if rid is not None:
+                        with self._resp_cv:
+                            self._responses[rid] = msg
+                            self._resp_cv.notify_all()
+            except Exception:
+                time.sleep(0.05)
+
+    def cmd(self, command: List, wait: bool = True, timeout: float = 3.0) -> dict:
+        """
+        Envía comando; si wait=True espera la respuesta por request_id.
+        """
+        if self.sock is None:
+            raise RuntimeError("IPC no conectado")
+
+        with self._lock:
+            self._req_id += 1
+            rid = self._req_id
+            payload = {"command": command, "request_id": rid}
+            data = (json.dumps(payload) + "\n").encode("utf-8")
+            self.sock.sendall(data)
+
+        if not wait:
+            return {"error": "success"}
+
+        deadline = time.time() + timeout
+        with self._resp_cv:
+            while time.time() < deadline:
+                if rid in self._responses:
+                    return self._responses.pop(rid)
+                self._resp_cv.wait(timeout=0.1)
+
+        return {"error": "timeout", "request_id": rid, "command": command}
+
+    def reset_endfiles(self):
         with self.endfile_lock:
             self.endfile_count = 0
 
-    def wait_block_done(self) -> bool:
-        """
-        Espera a que terminen BLOCK_SIZE videos.
-        """
+    def wait_block_done(self, n: int = BLOCK_SIZE):
         while True:
             with self.endfile_lock:
-                if self.endfile_count >= BLOCK_SIZE:
-                    return True
-            time.sleep(POLL_DT)
-
-    def load_block(self, block: List[Path]):
-        """
-        Carga 4 videos como playlist en mpv SIN cerrar.
-        IMPORTANTÍSIMO: usar append (NO append-play) para que suene en orden.
-        """
-        if len(block) != BLOCK_SIZE:
-            return False
-
-        self.reset_endfile_counter()
-
-        # pausar y limpiar playlist
-        self.cmd(["set_property", "pause", True])
-        self.cmd(["playlist-clear"])
-
-        # 1) replace
-        self.cmd(["loadfile", str(block[0]), "replace"])
-        # 2) append (no play)
-        for p in block[1:]:
-            self.cmd(["loadfile", str(p), "append"])
-
-        # asegurar arrancar desde el primero
-        self.cmd(["set_property", "playlist-pos", 0])
-        self.cmd(["set_property", "pause", False])
-        return True
+                if self.endfile_count >= n:
+                    return
+            time.sleep(0.05)
 
 # =======================
-# NETWORK STATE
+# MPV VIDEO process mgmt
 # =======================
 
-leader_ip_lock = threading.Lock()
-leader_ip: Optional[str] = None
-last_leader_seen = 0.0
+mpv_proc: Optional[subprocess.Popen] = None
 
-followers_lock = threading.Lock()
-followers = {}  # ip -> last_seen
+def kill_old_mpv_if_any():
+    """
+    Si quedó un mpv viejo con ese socket (o el socket huérfano), lo cerramos.
+    """
+    if not os.path.exists(IPC_SOCKET):
+        return
 
-# leader: primer DONE recibido para idx actual
-first_done_evt = threading.Event()
+    # Intento elegante: conectar y mandar quit
+    try:
+        ipc = MPVIPC(IPC_SOCKET)
+        ipc.connect(timeout=1.0)
+        ipc.cmd(["quit"], wait=False)
+        ipc.close()
+        time.sleep(0.4)
+    except Exception:
+        pass
 
-# =======================
-# NETWORK (LEADER)
-# =======================
-
-def leader_broadcast_loop(stop_evt: threading.Event):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    while not stop_evt.is_set():
+    # Si el socket sigue, es huérfano o mpv no salió
+    if os.path.exists(IPC_SOCKET):
         try:
-            s.sendto(b"LEADER_HERE", ("255.255.255.255", BCAST_PORT))
+            os.remove(IPC_SOCKET)
         except Exception:
             pass
-        time.sleep(1)
 
-def leader_listen_register_loop(stop_evt: threading.Event):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("", REG_PORT))
-    while not stop_evt.is_set():
-        data, addr = s.recvfrom(1024)
-        msg = data.decode("utf-8", errors="ignore").strip()
-        if msg.startswith("REGISTER:"):
-            ip = addr[0]
-            with followers_lock:
-                followers[ip] = time.time()
-            log("LEADER", f"REGISTER {ip} :: {msg}")
+def start_mpv_video() -> MPVIPC:
+    global mpv_proc
 
-def leader_listen_done_loop(stop_evt: threading.Event, current_idx_ref):
-    """
-    DONE:<idx> desde followers.
-    Marca first_done_evt si coincide con idx actual.
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("", DONE_PORT))
-    while not stop_evt.is_set():
-        data, addr = s.recvfrom(1024)
-        msg = data.decode("utf-8", errors="ignore").strip()
-        if msg.startswith("DONE:"):
-            try:
-                didx = int(msg.split(":", 1)[1])
-            except:
-                continue
-            if didx == current_idx_ref["idx"]:
-                if not first_done_evt.is_set():
-                    log("LEADER", f"FIRST DONE idx={didx} from {addr[0]}")
-                    first_done_evt.set()
+    kill_old_mpv_if_any()
 
-def leader_broadcast_play(idx: int):
-    msg = f"PLAY:{idx}".encode("utf-8")
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    s.sendto(msg, ("255.255.255.255", CMD_PORT))
-    s.close()
+    rot = ORIENTATION_MAP[ORIENTATION]["rotation"]
 
-# =======================
-# NETWORK (FOLLOWER)
-# =======================
+    # Lanzar mpv persistente (sin VDPAU; hwdec correcto Pi)
+    mpv_proc = subprocess.Popen([
+        "mpv",
+        "--idle=yes",
+        "--fs",
+        "--force-window=yes",
+        "--keep-open=yes",
+        "--no-terminal",
+        "--quiet",
+        "--hwdec=drm-copy",
+        "--vd=no",
+        "--vo=gpu",
+        "--scale=bilinear",
+        f"--video-rotate={rot}",
+        "--panscan=1.0",
+        "--stop-screensaver=yes",
+        f"--input-ipc-server={IPC_SOCKET}",
+    ])
 
-def follower_discover_leader_loop(stop_evt: threading.Event):
-    global leader_ip, last_leader_seen
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("", BCAST_PORT))
-    while not stop_evt.is_set():
-        data, addr = s.recvfrom(1024)
-        msg = data.decode("utf-8", errors="ignore")
-        if msg.startswith("LEADER_HERE"):
-            with leader_ip_lock:
-                leader_ip = addr[0]
-                last_leader_seen = time.time()
+    # esperar socket
+    for _ in range(120):
+        if os.path.exists(IPC_SOCKET):
+            break
+        time.sleep(0.1)
+    else:
+        raise RuntimeError("mpv IPC no apareció")
 
-def follower_register_once():
-    with leader_ip_lock:
-        lip = leader_ip
-    if not lip:
-        return
+    ipc = MPVIPC(IPC_SOCKET)
+    ipc.connect(timeout=2.0)
+
+    # prueba simple
+    resp = ipc.cmd(["get_property", "idle-active"], wait=True, timeout=2.0)
+    log("MPV", f"IPC OK, idle-active={resp.get('data')}")
+
+    return ipc
+
+def stop_mpv_video(ipc: MPVIPC):
+    global mpv_proc
     try:
-        host = socket.gethostname()
-        msg = f"REGISTER:{host}:ROLE={ROLE}".encode("utf-8")
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.sendto(msg, (lip, REG_PORT))
-        s.close()
+        ipc.cmd(["quit"], wait=False)
     except Exception:
         pass
-
-def follower_listen_cmd_loop(stop_evt: threading.Event, on_play):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("", CMD_PORT))
-    while not stop_evt.is_set():
-        data, _ = s.recvfrom(1024)
-        msg = data.decode("utf-8", errors="ignore").strip()
-        if msg.startswith("PLAY:"):
-            try:
-                idx = int(msg.split(":", 1)[1])
-            except:
-                continue
-            on_play(idx)
-
-def follower_send_done(idx: int):
-    with leader_ip_lock:
-        lip = leader_ip
-    if not lip:
-        return
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.sendto(f"DONE:{idx}".encode("utf-8"), (lip, DONE_PORT))
-        s.close()
-        log("FOLLOWER", f"DONE idx={idx}")
+        ipc.close()
     except Exception:
         pass
-
-# =======================
-# MODES
-# =======================
-
-def leader_main(stop_evt: threading.Event, mpv: MPVController):
-    playlist = build_category_playlist()
-    if not playlist:
-        log("LEADER", f"No hay categorías en {BASE_VIDEO_DIR}")
-        while True:
-            time.sleep(1)
-
-    current_idx_ref = {"idx": 0}
-
-    # network threads
-    threading.Thread(target=leader_broadcast_loop, args=(stop_evt,), daemon=True).start()
-    threading.Thread(target=leader_listen_register_loop, args=(stop_evt,), daemon=True).start()
-    threading.Thread(target=leader_listen_done_loop, args=(stop_evt, current_idx_ref), daemon=True).start()
-
-    log("LEADER", f"Playlist categorías creada: {len(playlist)} (ROUNDS={ROUNDS})")
-
-    while not stop_evt.is_set():
-        idx = current_idx_ref["idx"]
-        if idx >= len(playlist):
-            playlist = build_category_playlist()
-            current_idx_ref["idx"] = 0
-            idx = 0
-            log("LEADER", f"Rebuild playlist categorías: {len(playlist)}")
-
-        cat = playlist[idx]
-        block = pick_block(cat)
-        if len(block) != BLOCK_SIZE:
-            log("LEADER", f"Skip cat sin 1+3: {cat}")
-            current_idx_ref["idx"] += 1
-            continue
-
-        first_done_evt.clear()
-
-        # orden a todos (aunque no haya nadie)
-        leader_broadcast_play(idx)
-        log("LEADER", f"PLAY idx={idx} cat={cat}")
-
-        # reproduce local (siempre)
-        ok = mpv.load_block(block)
-        if not ok:
-            log("LEADER", "load_block falló")
-            time.sleep(0.2)
-            continue
-
-        # espera: o DONE externo, o termina su bloque
-        while True:
-            if first_done_evt.is_set():
-                log("LEADER", "DONE externo primero -> NEXT")
-                break
-            with mpv.endfile_lock:
-                if mpv.endfile_count >= BLOCK_SIZE:
-                    log("LEADER", "Leader terminó primero -> NEXT")
-                    break
-            time.sleep(POLL_DT)
-
-        current_idx_ref["idx"] += 1
-
-def follower_main(stop_evt: threading.Event, mpv: MPVController):
-    playlist = build_category_playlist()
-    if not playlist:
-        log("FOLLOWER", f"No hay categorías en {BASE_VIDEO_DIR}")
-        while True:
-            time.sleep(1)
-
-    mode = {"m": "AUTO"}  # AUTO | SYNC
-    current_idx = {"idx": 0}
-
-    def play_idx(idx: int):
-        # SYNC: el leader manda el idx; usamos el mismo playlist local
-        if idx < 0 or idx >= len(playlist):
-            return
-        mode["m"] = "SYNC"
-        current_idx["idx"] = idx
-        cat = playlist[idx]
-        block = pick_block(cat)
-        if len(block) != BLOCK_SIZE:
-            log("FOLLOWER", f"SYNC cat inválida: {cat}")
-            return
-        log("FOLLOWER", f"SYNC PLAY idx={idx} cat={cat}")
-        mpv.load_block(block)
-
-        # al terminar, manda DONE
-        mpv.wait_block_done()
-        follower_send_done(idx)
-
-    # discover leader + cmd listener
-    threading.Thread(target=follower_discover_leader_loop, args=(stop_evt,), daemon=True).start()
-    threading.Thread(target=follower_listen_cmd_loop, args=(stop_evt, play_idx), daemon=True).start()
-
-    log("FOLLOWER", f"AUTO playlist categorías: {len(playlist)} (ROUNDS={ROUNDS})")
-
-    # loop principal: AUTO si no hay leader
-    while not stop_evt.is_set():
-        # detect leader presence
-        with leader_ip_lock:
-            lip = leader_ip
-            seen = last_leader_seen
-
-        if lip and (time.time() - seen) < LEADER_TIMEOUT:
-            # leader presente
-            follower_register_once()
-            # si estamos en SYNC, esperamos comandos (no hacemos AUTO)
+    try:
+        if mpv_proc and mpv_proc.poll() is None:
+            mpv_proc.terminate()
             time.sleep(0.3)
-            continue
+            if mpv_proc.poll() is None:
+                mpv_proc.kill()
+    except Exception:
+        pass
+    mpv_proc = None
+    try:
+        if os.path.exists(IPC_SOCKET):
+            os.remove(IPC_SOCKET)
+    except Exception:
+        pass
 
-        # si no hay leader: AUTO
-        mode["m"] = "AUTO"
-        idx = current_idx["idx"]
+# =======================
+# BLOCK LOAD (orden garantizado)
+# =======================
+
+def mpv_load_block(ipc: MPVIPC, block: List[Path]) -> bool:
+    if len(block) != BLOCK_SIZE:
+        return False
+
+    ipc.reset_endfiles()
+
+    # Pausa y limpia playlist; esperamos respuesta para asegurar orden
+    ipc.cmd(["set_property", "pause", True], wait=True, timeout=2.0)
+    ipc.cmd(["playlist-clear"], wait=True, timeout=2.0)
+
+    # 1) replace (esperar)
+    r = ipc.cmd(["loadfile", str(block[0]), "replace"], wait=True, timeout=4.0)
+    if r.get("error") not in (None, "success"):
+        log("MPV", f"loadfile replace error: {r}")
+        return False
+
+    # 2) append (esperar cada uno para evitar race)
+    for p in block[1:]:
+        r = ipc.cmd(["loadfile", str(p), "append"], wait=True, timeout=4.0)
+        if r.get("error") not in (None, "success"):
+            log("MPV", f"loadfile append error: {r}")
+            return False
+
+    # arrancar desde el primero
+    ipc.cmd(["set_property", "playlist-pos", 0], wait=True, timeout=2.0)
+    ipc.cmd(["set_property", "pause", False], wait=True, timeout=2.0)
+    return True
+
+# =======================
+# STANDALONE LOOP (AUTO)
+# =======================
+
+def standalone_loop(stop_evt: threading.Event, ipc: MPVIPC, tag: str):
+    playlist = build_category_playlist()
+    if not playlist:
+        log(tag, f"No hay categorías en {BASE_VIDEO_DIR}")
+        while not stop_evt.is_set():
+            time.sleep(1)
+
+    log(tag, f"Standalone activo. Playlist categorías={len(playlist)} (ROUNDS={ROUNDS})")
+
+    idx = 0
+    while not stop_evt.is_set():
         if idx >= len(playlist):
             playlist = build_category_playlist()
             idx = 0
-            current_idx["idx"] = 0
+            log(tag, f"Rebuild playlist categorías={len(playlist)}")
 
         cat = playlist[idx]
         block = pick_block(cat)
         if len(block) != BLOCK_SIZE:
-            current_idx["idx"] += 1
-            time.sleep(0.05)
+            idx += 1
             continue
 
-        log("FOLLOWER", f"AUTO PLAY idx={idx} cat={cat}")
-        mpv.load_block(block)
-        mpv.wait_block_done()
-        current_idx["idx"] += 1
+        log(tag, f"▶ idx={idx} cat={cat}")
+        ok = mpv_load_block(ipc, block)
+        if not ok:
+            # si algo salió mal, intentamos continuar sin quedarnos colgados
+            time.sleep(0.2)
+            idx += 1
+            continue
+
+        ipc.wait_block_done(BLOCK_SIZE)
+        idx += 1
 
 # =======================
 # MAIN
@@ -547,19 +415,26 @@ def follower_main(stop_evt: threading.Event, mpv: MPVController):
 def main():
     stop_evt = threading.Event()
 
+    def handle_sig(*_):
+        stop_evt.set()
+
+    signal.signal(signal.SIGINT, handle_sig)
+    signal.signal(signal.SIGTERM, handle_sig)
+
     # audio independiente
     threading.Thread(target=audio_loop, args=(stop_evt,), daemon=True).start()
 
-    # mpv video persistente
-    mpv = MPVController(IPC_SOCKET)
-    mpv.start_mpv()
+    # video mpv persistente
+    ipc = start_mpv_video()
 
-    if ROLE == 0:
-        log("SYS", f"ROLE=LEADER ORIENTATION={ORIENTATION}")
-        leader_main(stop_evt, mpv)
-    else:
-        log("SYS", f"ROLE=FOLLOWER({ROLE}) ORIENTATION={ORIENTATION}")
-        follower_main(stop_evt, mpv)
+    try:
+        # Por ahora: standalone siempre (leader/follower sync lo activamos en el siguiente paso)
+        # Esto asegura que SIEMPRE reproduce aunque esté solo.
+        tag = "LEADER" if ROLE == 0 else f"FOLLOWER{ROLE}"
+        standalone_loop(stop_evt, ipc, tag)
+
+    finally:
+        stop_mpv_video(ipc)
 
 if __name__ == "__main__":
     main()
