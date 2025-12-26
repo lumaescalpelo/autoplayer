@@ -31,7 +31,7 @@ ROLE = 0
 
 # Orientación física de la pantalla:
 # "hor" | "ver" | "inverted_hor" | "inverted_ver"
-ORIENTATION = "hor"
+ORIENTATION = "inverted_ver"
 
 # Directorios base
 BASE_VIDEO_DIR = Path.home() / "Videos" / "videos_hd_final"
